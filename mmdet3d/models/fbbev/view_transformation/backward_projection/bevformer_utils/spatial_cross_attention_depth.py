@@ -91,13 +91,13 @@ class DA_SpatialCrossAttention(BaseModule):
                 key_padding_mask=None,
                 reference_points=None,
                 spatial_shapes=None,
-                reference_points_cam=None,
+                reference_points_cam=None,  #From point samping N, bs, H*W, D, 2
                 level_start_index=None,
                 flag='encoder',
-                bev_query_depth=None,
+                bev_query_depth=None,   #From point Sampling N, bs, H*W, D, 1
                 pred_img_depth=None,
                 bev_mask=None,
-                per_cam_mask_list=None,                
+                per_cam_mask_list=None,  #From point Sampling N, bs, H*W, D
                 **kwargs):
         """Forward Function of Detr3DCrossAtten.
         Args:
