@@ -624,8 +624,9 @@ class LSSViewTransformerFunction3D(BaseModule):
                                    self.ranks_feat, self.ranks_bev,
                                    bev_feat_shape, self.interval_starts,
                                    self.interval_lengths)
-            assert False
-            bev_feat = bev_feat.squeeze(2)
+            #assert False
+            bev_feat = bev_feat.permute(0, 1, 3, 4, 2)
+            #bev_feat = bev_feat.squeeze(2)
         else:
             coor = self.get_lidar_coor(*cam_params)
             bev_feat = self.voxel_pooling_v2(

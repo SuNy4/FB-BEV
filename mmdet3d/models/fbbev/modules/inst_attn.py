@@ -8,7 +8,7 @@ import torch.utils.checkpoint as cp
 from mmdet.models import NECKS
 from mmcv.ops import MultiScaleDeformableAttention
 from mmcv.runner import force_fp32, auto_fp16
-
+from .deform_squeeze import DeformableSqueezeAttention
 
 @NECKS.register_module()
 class TransformerLayer(nn.Module):
@@ -67,12 +67,18 @@ class DeformableTransformerLayer(nn.Module):
         self.z_bound = grid_config['z']
         self.embed_dims = embed_dims
         self.norm1 = norm_layer(embed_dims)
-
+        if isinstance(attn_layer, str):
+            if attn_layer == 'DeformableSqueezeAttention':
+                attn_layer = DeformableSqueezeAttention
+            elif attn_layer == 'MultiScaleDeformableAttention':
+                attn_layer = MultiScaleDeformableAttention
+            else:
+                raise ValueError(f"Unknown attention layer: {attn_layer}")
         self.attn = attn_layer(
             embed_dims, num_heads, num_levels, num_points, batch_first=True, im2col_step=256)
         if mlp_ratio == 0:
             return
-        self.final_dim=data_config['input_size']
+        self.original_dim=data_config['src_size']
         self.norm2 = norm_layer(embed_dims)
         self.ffn = nn.Sequential(
             nn.Linear(embed_dims, embed_dims * mlp_ratio),
@@ -105,21 +111,18 @@ class DeformableTransformerLayer(nn.Module):
             coords[..., 1] = coords[..., 1] * y_range + self.y_bound[0]
             coords[..., 2] = coords[..., 2] * z_range + self.z_bound[0]
 
-            world_coords = coords.to(device)
+            world_coords = coords
 
             return world_coords
                 # reference points in 3D space, used in spatial cross-attention (SCA)
 
         if dim == '3d':
 
-            X = torch.arange(*self.x_bound, dtype=torch.float) + self.x_bound[-1]/2
-            Y = torch.arange(*self.y_bound, dtype=torch.float) + self.y_bound[-1]/2
-            Z = torch.arange(*self.z_bound, dtype=torch.float) + self.z_bound[-1]/2
-            Y, X, Z = torch.meshgrid([Y, X, Z])
-            coords = torch.stack([X, Y, Z], dim=-1)
-            coords = coords.to(dtype).to(device)
-            # frustum = torch.cat([coords, torch.ones_like(coords[...,0:1])], dim=-1) #(x, y, z, 4)
-            return coords, coords
+            coords[..., 0] = (coords[..., 0] + self.x_bound[0]) / self.x_bound[-1]
+            coords[..., 1] = (coords[..., 0] + self.y_bound[0]) / self.y_bound[-1]
+            coords[..., 2] = (coords[..., 0] + self.z_bound[0]) / self.z_bound[-1]
+
+            return coords
     
     @force_fp32(apply_to=('reference_points', 'cam_params'))
     def point_sampling(self, reference_points, pc_range=None,  
@@ -128,7 +131,7 @@ class DeformableTransformerLayer(nn.Module):
         rots, trans, intrins, post_rots, post_trans, bda = cam_params
         B, N, _ = trans.shape
         eps = 1e-5
-        ogfH, ogfW = self.final_dim
+        ogfH, ogfW = self.original_dim
         reference_points = reference_points[None, None].repeat(B, N, 1, 1, 1, 1)
         reference_points = torch.inverse(bda).view(B, 1, 1, 1, 1, 3,
                           3).matmul(reference_points.unsqueeze(-1)).squeeze(-1)
@@ -159,9 +162,9 @@ class DeformableTransformerLayer(nn.Module):
         rots, trans, intrins, post_rots, post_trans, bda = cam_params
         B, N, _ = trans.shape
         eps = 1e-5
-        ogfH, ogfW = self.final_dim
+        ogfH, ogfW = self.original_dim
 
-        reference_points = reference_points[None, None].repeat(B, N, 1, 1)
+        reference_points = reference_points.unsqueeze(1).repeat(1, N, 1, 1)
         reference_points = torch.inverse(bda).view(B, 1, 1, 3,
                           3).matmul(reference_points.unsqueeze(-1)).squeeze(-1)
         reference_points = reference_points - trans.view(B, N, 1, 3)
@@ -197,6 +200,7 @@ class DeformableTransformerLayer(nn.Module):
                 ref_pts=None,
                 img_value=False,
                 bev_value=False,
+                occ_value=False,
                 spatial_shapes=None,
                 level_start_index=None,
                 cam_params=None,
@@ -215,6 +219,14 @@ class DeformableTransformerLayer(nn.Module):
                 device='cuda', 
                 dtype=torch.float
                 )
+            voxel_ref_3d=None
+            
+            # voxel_ref_3d = self.get_reference_points(
+            #     coords=ref_pts,
+            #     dim='3d', 
+            #     device='cuda', 
+            #     dtype=torch.float
+            #     )
             
             ref_pts_3d, ref_pts, per_cam_mask_list, cam_pts = self.queries_point_sampling(
                 wrld_ref_3d, cam_params=cam_params)
@@ -263,8 +275,11 @@ class DeformableTransformerLayer(nn.Module):
             value = value.flatten(start_dim=0, end_dim=1).flatten(start_dim=2, end_dim=3).permute(0,2,1).float()
 
         if bev_value:
-            ref_pts = ref_pts[None, None].permute(0, 2, 1, 3).repeat(bs, 1, self.num_levels, 1)[..., :2]
+            ref_pts = ref_pts.unsqueeze(2).repeat(1, 1, self.num_levels, 1)[..., :2]
 
+        if occ_value:
+            ref_pts = ref_pts.unsqueeze(2).repeat(1, 1, self.num_levels, 1)
+            
         query = query + self.attn(
             self.norm1(query),
             value=value,
@@ -287,7 +302,7 @@ class DeformableTransformerLayer(nn.Module):
                     index_query_per_img = indexes[j][i]
                     output[j, index_query_per_img] = query_per_cam[j, :len(index_query_per_img)]
 
-            return output
+            return output, voxel_ref_3d
         
         else:
             return query

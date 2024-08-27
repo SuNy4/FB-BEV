@@ -261,7 +261,7 @@ def main():
 
 
 
-    if 'freeze_depthplugin_components' in cfg and cfg['freeze_depthplugin_components'] is True:
+    if 'freeze_depthnet_components' in cfg and cfg['freeze_depthnet_components'] is True:
         from torch import nn
         def fix_bn_16(m):
             if isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.SyncBatchNorm):
@@ -270,9 +270,15 @@ def main():
         def fix_bn_32(m):
             if isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.SyncBatchNorm):
                 m.track_running_stats = False
-        model.depth_plugin_net.img_backbone.apply(fix_bn_16)
-        model.depth_plugin_net.img_neck.apply(fix_bn_16)
-        model.depth_plugin_net.depth_net.apply(fix_bn_32)
+        print('freezing backbone')
+        for param in model.img_backbone.parameters():
+            param.requires_grad = False
+
+        for param in model.img_neck.parameters():
+            param.requires_grad = False
+
+        for param in model.depth_net.parameters():
+            param.requires_grad = False
 
     if 'load_img_from' in cfg:
         logger.info(cfg.load_img_from)
