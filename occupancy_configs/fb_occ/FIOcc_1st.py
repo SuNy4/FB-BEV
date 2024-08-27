@@ -119,7 +119,7 @@ model = dict(
     #history_cat_num=history_cat_num,
     single_bev_num_channels=numC_Trans,
     readd=True,
-    embed_dim=back_dim_,
+    embed_dim=_dim_,
     n_queries=_num_queries_,
     attn_level=_num_levels_,
     grid_config = grid_config,
@@ -159,7 +159,7 @@ model = dict(
         grid_config=grid_config,
         input_size=data_config['input_size'],
         downsample=16,
-        accelerate=True
+        accelerate=False
     ),
     frpn=None,
 
@@ -167,13 +167,13 @@ model = dict(
     #     forward_channel=numC_Trans
     # ),
 
-    # bev_fcn_encoder=dict(
-    #     type='BEV2DFCN',
-    #     flatten_height=True,
-    #     height=occ_h,
-    #     in_channels =numC_Trans,
-    #     out_channels=_dim_
-    # ),
+    bev_fcn_encoder=dict(
+        type='BEV2DFCN',
+        flatten_height=True,
+        height=occ_h,
+        in_channels =numC_Trans,
+        out_channels=_dim_
+    ),
 
     inst_pos_embed=dict(
         type='LearnableSqueezePositionalEncoding',
@@ -182,32 +182,31 @@ model = dict(
         squeeze_dims=[1]
     ),
 
-    back_project=dict(
-        type='DeformableTransformerLayer',
-        embed_dims=back_dim_,
-        num_heads=_num_heads_,
-        num_levels=1,
-        num_points=8,
-        grid_config=grid_config,
-        data_config=data_config,
-    ),
+    # back_project=dict(
+    #     type='DeformableTransformerLayer',
+    #     embed_dims=back_dim_,
+    #     num_heads=_num_heads_,
+    #     num_levels=1,
+    #     num_points=12,
+    #     grid_config=grid_config,
+    #     data_config=data_config,
+    # ),
 
     deform_cross_attn=dict(
         type='DeformableTransformerLayer',
         embed_dims=_dim_,
         num_heads=_num_heads_,
         num_levels=1,
-        num_points=8,
-        attn_layer='DeformableSqueezeAttention',
+        num_points=12,
         grid_config=grid_config,
         data_config=data_config,
     ),
 
     bev_pos_embed=dict(
         type='LearnableSqueezePositionalEncoding',
-        num_embeds=[50, 50, 4],
+        num_embeds=[100, 100],
         embed_dims=_dim_,
-        squeeze_dims=[1, 1, 1]
+        squeeze_dims=[1, 1]
     ),
 
     bev_inst_feat_cross_attn=dict(

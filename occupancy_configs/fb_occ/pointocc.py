@@ -161,11 +161,12 @@ model = dict(
         downsample=16,
         accelerate=True
     ),
+    
     frpn=None,
 
-    # keypoint=dict(
-    #     forward_channel=numC_Trans
-    # ),
+    keypoint=dict(
+        forward_channel=numC_Trans
+    ),
 
     # bev_fcn_encoder=dict(
     #     type='BEV2DFCN',
@@ -175,12 +176,12 @@ model = dict(
     #     out_channels=_dim_
     # ),
 
-    inst_pos_embed=dict(
-        type='LearnableSqueezePositionalEncoding',
-        num_embeds=[_num_queries_],
-        embed_dims=_dim_,
-        squeeze_dims=[1]
-    ),
+    # inst_pos_embed=dict(
+    #     type='LearnableSqueezePositionalEncoding',
+    #     num_embeds=[_num_queries_],
+    #     embed_dims=_dim_,
+    #     squeeze_dims=[1]
+    # ),
 
     back_project=dict(
         type='DeformableTransformerLayer',
@@ -192,7 +193,24 @@ model = dict(
         data_config=data_config,
     ),
 
-    deform_cross_attn=dict(
+    # deform_cross_attn=dict(
+    #     type='DeformableTransformerLayer',
+    #     embed_dims=_dim_,
+    #     num_heads=_num_heads_,
+    #     num_levels=1,
+    #     num_points=12,
+    #     grid_config=grid_config,
+    #     data_config=data_config,
+    # ),
+
+    bev_pos_embed=dict(
+        type='LearnableSqueezePositionalEncoding',
+        num_embeds=[50, 50, 4],
+        embed_dims=_dim_,
+        squeeze_dims=[1, 1, 1]
+    ),
+
+    occ_self_attn=dict(
         type='DeformableTransformerLayer',
         embed_dims=_dim_,
         num_heads=_num_heads_,
@@ -203,19 +221,12 @@ model = dict(
         data_config=data_config,
     ),
 
-    bev_pos_embed=dict(
-        type='LearnableSqueezePositionalEncoding',
-        num_embeds=[50, 50, 4],
-        embed_dims=_dim_,
-        squeeze_dims=[1, 1, 1]
-    ),
-
-    bev_inst_feat_cross_attn=dict(
-        type='TransformerLayer',
-        embed_dims=_dim_,
-        num_heads=_num_heads_,
-        mlp_ratio=0
-    ),
+    # bev_inst_feat_cross_attn=dict(
+    #     type='TransformerLayer',
+    #     embed_dims=_dim_,
+    #     num_heads=_num_heads_,
+    #     mlp_ratio=0
+    # ),
 
     # bev_inst_h_cross_attn=dict(
     #     type='TransformerLayer',
@@ -242,9 +253,7 @@ model = dict(
     #     out_channels=voxel_out_channel,
     #     norm_cfg=dict(type='SyncBN', requires_grad=True),
     # ),
-
     backward_projection=None,
-
     occupancy_head= dict(
         type='OccHead',
         with_cp=use_checkpoint,
