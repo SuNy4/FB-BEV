@@ -103,7 +103,7 @@ def nuscenes_data_prep(root_path, info_prefix, version, max_sweeps=10):
 
 def add_ann_adj_info(extra_tag, with_lidar_seg=False):
     nuscenes_version = VERSION
-    dataroot = f'/data/datasets/{NUSCENES}-full/'
+    dataroot = f'./data/{NUSCENES}/'
     nuscenes = NuScenes(nuscenes_version, dataroot)
 
     # for set in ['test']:
@@ -144,7 +144,7 @@ def add_ann_adj_info(extra_tag, with_lidar_seg=False):
 
     for set in ['train', 'val']:
         dataset = pickle.load(
-            open('/data/datasets/%s-full/%s_infos_%s.pkl' % (NUSCENES, extra_tag, set), 'rb'))
+            open('./data/%s/%s_infos_%s.pkl' % (NUSCENES, extra_tag, set), 'rb'))
         for id in range(len(dataset['infos'])):
             if id % 10 == 0:
                 print('%d/%d' % (id, len(dataset['infos'])))
@@ -174,7 +174,7 @@ def add_ann_adj_info(extra_tag, with_lidar_seg=False):
             scene = nuscenes.get('scene', sample['scene_token'])
             dataset['infos'][id]['occ_path'] = \
                 './data/nuscenes/gts/%s/%s'%(scene['name'], info['token'])
-        with open('/data/datasets/%s-full/%s_infos_%s.pkl' % (NUSCENES, extra_tag, set),
+        with open('./data/%s/%s_infos_%s.pkl' % (NUSCENES, extra_tag, set),
                   'wb') as fid:
             pickle.dump(dataset, fid)
 
@@ -183,7 +183,7 @@ if __name__ == '__main__':
     dataset = 'nuscenes'
     version = 'v1.0'
     train_version = VERSION
-    root_path = f'/data/datasets/{NUSCENES}-full'
+    root_path = f'./data/{NUSCENES}'
     extra_tag = 'bevdetv2-nuscenes'
     nuscenes_data_prep(
         root_path=root_path,

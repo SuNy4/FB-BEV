@@ -268,9 +268,9 @@ model = dict(
 
 # Data
 dataset_type = 'NuScenesDataset'
-data_root = './data/'
+data_root = './data/nuscenes/'
 file_client_args = dict(backend='disk')
-occupancy_path = './data/gts/'
+occupancy_path = './data/nuscenes/gts/'
 
 
 train_pipeline = [
