@@ -161,7 +161,23 @@ def custom_multi_gpu_test(model, data_loader, tmpdir=None, gpu_collect=False):
     have_mask = False
     for i, data in enumerate(data_loader):
         with torch.no_grad():
-            result = model(return_loss=False, rescale=True, **data)
+            start_t = time.time()
+            result, end_t = model(return_loss=False, rescale=True, **data)
+            #print(f"\n{end_t-start_t}")
+            # if i <= 10:
+            #     import os
+            #     data_read = data['img_metas'][0].data[0][0]
+            #     scene_dir = data_read['scene_name']
+            #     sample_dir = data_read['curr']['token']
+            #     save_dir = './vis_target/'+f"{scene_dir}/"+f"{sample_dir}/"
+            #     vis_target = np.uint8(result[0]['pred_occupancy'])
+            #     os.makedirs(save_dir, exist_ok=True)
+            #     gt_target = data['gt_occupancy'][0][0]
+            #     np.save(save_dir + f'pred.npy', vis_target)
+            #     np.save(save_dir + f'gt.npy', gt_target)
+            # else:
+            #     assert False
+                
             # encode mask results
             if isinstance(result, dict):
                 if 'bbox_results' in result.keys():

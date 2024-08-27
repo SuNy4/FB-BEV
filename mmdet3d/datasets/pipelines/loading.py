@@ -199,9 +199,10 @@ class LoadOccupancy(object):
         occupancy = torch.flip(occupancy, [1])
         occupancy = occupancy.permute(1, 2, 0)
 
-        
+        ###############
         if self.fix_void:
             occupancy[occupancy<255] = occupancy[occupancy<255] + 1
+        ###############
 
         for class_ in self.ignore_classes:
             occupancy[occupancy==class_] = 255
