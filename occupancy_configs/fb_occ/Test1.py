@@ -6,8 +6,8 @@
 
 
 # we follow the online training settings  from solofusion
-num_gpus = 1
-samples_per_gpu = 32
+num_gpus = 2
+samples_per_gpu = 24
 num_iters_per_epoch = int(28130 // (num_gpus * samples_per_gpu) * 4.554)
 num_epochs = 20
 checkpoint_epoch_interval = 1
@@ -99,7 +99,7 @@ _pos_dim_ = 40
 _ffn_dim_ = numC_Trans * 4
 _num_heads_ = 8
 _num_levels_= 2
-_num_queries_=100
+_num_queries_=300
 
 empty_idx = 18  # noise 0-->255
 num_cls = 19  # 0 others, 1-16 obj, 17 free
@@ -120,7 +120,6 @@ model = dict(
     single_bev_num_channels=numC_Trans,
     readd=True,
     embed_dim=_dim_,
-    n_queries=_num_queries_,
     attn_level=_num_levels_,
     grid_config = grid_config,
 
@@ -135,6 +134,7 @@ model = dict(
         norm_eval=False,
         with_cp=use_checkpoint,
         style='pytorch'),
+
     img_neck=dict(
         type='CustomFPN',
         in_channels=[1024, 2048],
@@ -143,6 +143,7 @@ model = dict(
         start_level=0,
         with_cp=use_checkpoint,
         out_ids=[0]),
+
     depth_net=dict(
         type='CM_DepthNet', # camera-aware depth net
         in_channels=back_dim_,
@@ -154,6 +155,7 @@ model = dict(
         loss_depth_weight=1.,
         use_dcn=False,
     ),
+
     forward_projection=dict(
         type='LSSViewTransformerFunction3D',
         grid_config=grid_config,
@@ -163,47 +165,13 @@ model = dict(
     ),
     frpn=None,
 
-    bev_fcn_encoder=dict(
-        type='BEV2DFCN',
-        flatten_height=True,
-        height=occ_h,
+    bev_fcn3d_encoder=dict(
+        type='BEV3DFCN',
         in_channels =numC_Trans,
-        out_channels=_dim_
-    ),
-
-    inst_pos_embed=dict(
-        type='LearnableSqueezePositionalEncoding',
-        num_embeds=[_num_queries_],
-        embed_dims=_dim_,
-        squeeze_dims=[1]
-    ),
-
-    deform_cross_attn=dict(
-        type='DeformableTransformerLayer',
-        embed_dims=_dim_,
-        num_heads=_num_heads_,
-        num_levels=1,
-        num_points=12,
-        grid_config=grid_config,
-        data_config=data_config,
-    ),
-
-    bev_pos_embed=dict(
-        type='LearnableSqueezePositionalEncoding',
-        num_embeds=[100, 100],
-        embed_dims=_dim_,
-        squeeze_dims=[1, 1]
-    ),
-
-    bev_inst_feat_cross_attn=dict(
-        type='TransformerLayer',
-        embed_dims=_dim_,
-        num_heads=_num_heads_,
-        mlp_ratio=0
+        out_channels=128
     ),
 
     backward_projection=None,
-
     occupancy_head= dict(
         type='OccHead',
         with_cp=use_checkpoint,
@@ -213,7 +181,7 @@ model = dict(
         final_occ_size=occ_size,
         empty_idx=empty_idx,
         num_level=1, #len(voxel_out_indices),
-        in_channels=80, #[voxel_out_channel] * len(voxel_out_indices),
+        in_channels=128, #[voxel_out_channel] * len(voxel_out_indices),
         out_channel=num_cls,
         point_cloud_range=point_cloud_range,
         loss_weight_cfg=dict(

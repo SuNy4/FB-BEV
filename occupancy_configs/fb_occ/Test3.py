@@ -6,7 +6,7 @@
 
 
 # we follow the online training settings  from solofusion
-num_gpus = 1
+num_gpus = 2
 samples_per_gpu = 32
 num_iters_per_epoch = int(28130 // (num_gpus * samples_per_gpu) * 4.554)
 num_epochs = 20
@@ -119,7 +119,7 @@ model = dict(
     #history_cat_num=history_cat_num,
     single_bev_num_channels=numC_Trans,
     readd=True,
-    embed_dim=_dim_,
+    embed_dim=back_dim_,
     n_queries=_num_queries_,
     attn_level=_num_levels_,
     grid_config = grid_config,
@@ -161,15 +161,6 @@ model = dict(
         downsample=16,
         accelerate=False
     ),
-    frpn=None,
-
-    bev_fcn_encoder=dict(
-        type='BEV2DFCN',
-        flatten_height=True,
-        height=occ_h,
-        in_channels =numC_Trans,
-        out_channels=_dim_
-    ),
 
     inst_pos_embed=dict(
         type='LearnableSqueezePositionalEncoding',
@@ -178,21 +169,32 @@ model = dict(
         squeeze_dims=[1]
     ),
 
+    back_project=dict(
+        type='DeformableTransformerLayer',
+        embed_dims=back_dim_,
+        num_heads=_num_heads_,
+        num_levels=1,
+        num_points=8,
+        grid_config=grid_config,
+        data_config=data_config,
+    ),
+
     deform_cross_attn=dict(
         type='DeformableTransformerLayer',
         embed_dims=_dim_,
         num_heads=_num_heads_,
         num_levels=1,
-        num_points=12,
+        num_points=8,
+        attn_layer='DeformableSqueezeAttention',
         grid_config=grid_config,
         data_config=data_config,
     ),
 
     bev_pos_embed=dict(
         type='LearnableSqueezePositionalEncoding',
-        num_embeds=[100, 100],
+        num_embeds=[50, 50, 4],
         embed_dims=_dim_,
-        squeeze_dims=[1, 1]
+        squeeze_dims=[1, 1, 1]
     ),
 
     bev_inst_feat_cross_attn=dict(
@@ -201,8 +203,6 @@ model = dict(
         num_heads=_num_heads_,
         mlp_ratio=0
     ),
-
-    backward_projection=None,
 
     occupancy_head= dict(
         type='OccHead',

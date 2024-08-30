@@ -6,9 +6,9 @@
 
 
 # we follow the online training settings  from solofusion
-num_gpus = 1
+num_gpus = 2
 samples_per_gpu = 32
-num_iters_per_epoch = int(28130 // (num_gpus * samples_per_gpu) * 4.554)
+num_iters_per_epoch = int(28130 // (num_gpus * samples_per_gpu) * 4.554) # full scene: 28130, single scene: 40 
 num_epochs = 20
 checkpoint_epoch_interval = 1
 use_custom_eval_hook = True
@@ -19,7 +19,7 @@ use_custom_eval_hook = True
 # lowering performance. To increase diversity, we split each training sequence
 # in half to ~20 keyframes, and sample these shorter sequences during training.
 # During testing, we do not do this splitting.
-train_sequences_split_num = 2
+train_sequences_split_num = 8
 test_sequences_split_num = 1
 
 # By default, 3D detection datasets randomly choose another sample if there is
@@ -163,6 +163,10 @@ model = dict(
     ),
     frpn=None,
 
+    # keypoint=dict(
+    #     forward_channel=numC_Trans
+    # ),
+
     bev_fcn_encoder=dict(
         type='BEV2DFCN',
         flatten_height=True,
@@ -178,12 +182,23 @@ model = dict(
         squeeze_dims=[1]
     ),
 
+    back_project=dict(
+        type='DeformableTransformerLayer',
+        embed_dims=_dim_,
+        num_heads=_num_heads_,
+        num_levels=1,
+        num_points=12,
+        grid_config=grid_config,
+        data_config=data_config,
+    ),
+
     deform_cross_attn=dict(
         type='DeformableTransformerLayer',
         embed_dims=_dim_,
         num_heads=_num_heads_,
         num_levels=1,
         num_points=12,
+        #attn_layer='DeformableSqueezeAttention',
         grid_config=grid_config,
         data_config=data_config,
     ),
@@ -201,6 +216,32 @@ model = dict(
         num_heads=_num_heads_,
         mlp_ratio=0
     ),
+
+    # bev_inst_h_cross_attn=dict(
+    #     type='TransformerLayer',
+    #     embed_dims=_dim_,
+    #     kdim=_dim_,
+    #     vdim=occ_h,
+    #     num_heads=_num_heads_,
+    #     mlp_ratio=0
+    # ),
+    # img_bev_encoder_backbone=dict(
+    #     type='CustomResNet3D',
+    #     depth=18,
+    #     with_cp=use_checkpoint,
+    #     block_strides=[1, 2, 2],
+    #     n_input_channels=numC_Trans,
+    #     block_inplanes=voxel_channels,
+    #     out_indices=voxel_out_indices,
+    #     norm_cfg=dict(type='SyncBN', requires_grad=True),
+    # ),
+    # img_bev_encoder_neck=dict(
+    #     type='FPN3D',
+    #     with_cp=use_checkpoint,
+    #     in_channels=voxel_channels,
+    #     out_channels=voxel_out_channel,
+    #     norm_cfg=dict(type='SyncBN', requires_grad=True),
+    # ),
 
     backward_projection=None,
 
@@ -310,7 +351,7 @@ share_data_config = dict(
 test_data_config = dict(
     pipeline=test_pipeline,
     sequences_split_num=test_sequences_split_num,
-    ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl')#'single_scene_train.pkl')#
+    ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl')#'single_scene_train.pkl')
 
 data = dict(
     samples_per_gpu=samples_per_gpu,
@@ -319,7 +360,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'bevdetv2-nuscenes_infos_train.pkl',#'single_scene_train.pkl'
+        ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl',#'single_scene_train.pkl')
         pipeline=train_pipeline,
         classes=class_names,
         test_mode=False,

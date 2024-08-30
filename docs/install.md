@@ -13,7 +13,7 @@ conda activate open-mmlab
 **b. Install PyTorch and torchvision following the [official instructions](https://pytorch.org/).**
 ```shell
 pip install torch==1.13.0+cu117 torchvision==0.14.0+cu117  -f https://download.pytorch.org/whl/torch_stable.html
-# Recommended torch>=1.12
+# Recommended 2.0.0> torch >= 1.12
 ```
 
 **c. Install mmcv-full.**
@@ -41,6 +41,9 @@ numpy==1.23.5
 numba==0.53.0
 spconv==2.3.6
 ipython==8.12.0
+yapf==0.40.1
+opencv-python==4.9.0.80
+open3d==0.18.0
 ```
 
 **g. Prepare pretrained models.**
