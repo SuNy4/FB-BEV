@@ -22,20 +22,22 @@ class AggregationBlock(nn.Module):
         return out
 
 class UpsampleLayer(nn.Module):
-    def __init__(self, scale_factor, mode, in_channels, out_channels, convtype):
+    def __init__(self, scale_factor, mode, in_channels=None, out_channels=None, convtype=None):
         super(UpsampleLayer, self).__init__()
         self.upsample = nn.Upsample(scale_factor=scale_factor, mode=mode, align_corners=True)
         if convtype=='2d':
             self.conv = nn.Conv2d(in_channels=in_channels, out_channels=out_channels, kernel_size=3, stride=1, padding=1)
         if convtype=='3d':
             self.conv = nn.Conv3d(in_channels=in_channels, out_channels=out_channels, kernel_size=3, stride=1, padding=1)
-        self.gelu = nn.GELU()
+        if convtype==None:
+            self.conv=None
 
     def forward(self, x):
         out = self.upsample(x)
-        out = self.conv(out)
+        if self.conv != None:
+            out = self.conv(out)
         return out
-    
+
 @NECKS.register_module()
 class BEV2DFCN(nn.Module):
     def __init__(self, flatten_height, height, in_channels, out_channels):
@@ -47,9 +49,10 @@ class BEV2DFCN(nn.Module):
         # self.bn_flat0 = nn.BatchNorm2d(self.in_channels*height/2)
         self.bn_flat1 = nn.BatchNorm2d(out_channels)
         self.gelu = nn.GELU()
-        self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.decoder1 = UpsampleLayer(2, 'bilinear', out_channels, out_channels, convtype='2d')
-        self.decoder2 = UpsampleLayer(2, 'bilinear', out_channels, out_channels, convtype='2d')
+        self.encoder1 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1)
+        self.encoder2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1)
+        self.decoder1 = UpsampleLayer(2, 'bilinear')
+        self.decoder2 = UpsampleLayer(2, 'bilinear')
         # self.encoder1 = AggregationBlock(out_channels, out_channels*2)
         # self.encoder2 = AggregationBlock(out_channels*2, out_channels*4)
         
@@ -69,17 +72,63 @@ class BEV2DFCN(nn.Module):
         # Downsample
         # e1 = self.encoder1(x)
         # e2 = self.encoder2(e1)
-        e1 = self.maxpool(x)
-        e2 = self.maxpool(e1)
+        e1 = self.gelu(self.bn1(self.encoder1(x))) #50
+        e2 = self.gelu(self.bn2(self.encoder2(e1))) #25
 
         # Upsample
-        d1 = self.gelu(self.bn1(self.decoder1(e2)))
+        d1 = self.decoder1(e2) #50
         d1 = d1 + e1
         
-        d2 = self.gelu(self.bn2(self.decoder2(d1)))
+        d2 = self.decoder2(d1)
         out = d2 + x
 
         return out
+
+####### Original FCN2D ################
+# @NECKS.register_module()
+# class BEV2DFCN(nn.Module):
+#     def __init__(self, flatten_height, height, in_channels, out_channels):
+#         super(BEV2DFCN, self).__init__()
+#         self.flatten_height = flatten_height
+#         self.in_channels = in_channels
+#         # self.conv0 = nn.Conv2d(self.in_channels*height, self.in_channels, kernel_size=1)
+#         self.conv1 = nn.Conv2d(self.in_channels*height, out_channels, kernel_size=1)
+#         # self.bn_flat0 = nn.BatchNorm2d(self.in_channels*height/2)
+#         self.bn_flat1 = nn.BatchNorm2d(out_channels)
+#         self.gelu = nn.GELU()
+#         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
+#         self.decoder1 = UpsampleLayer(2, 'bilinear', out_channels, out_channels, convtype='2d')
+#         self.decoder2 = UpsampleLayer(2, 'bilinear', out_channels, out_channels, convtype='2d')
+#         # self.encoder1 = AggregationBlock(out_channels, out_channels*2)
+#         # self.encoder2 = AggregationBlock(out_channels*2, out_channels*4)
+        
+#         # self.decoder1 = nn.ConvTranspose2d(out_channels*4, out_channels*2, padding=1, kernel_size=4, stride=2)
+#         # self.decoder2 = nn.ConvTranspose2d(out_channels*2, out_channels, padding=1, kernel_size=4, stride=2)
+        
+#         # Batch Normalization
+#         self.bn1 = nn.BatchNorm2d(out_channels)
+#         self.bn2 = nn.BatchNorm2d(out_channels)
+
+#     def forward(self, x):
+#         if self.flatten_height:
+#             # x = self.bn_flat0(self.conv0(x))
+#             x = self.bn_flat1(self.conv1(x))
+#             x = self.gelu(x)
+        
+#         # Downsample
+#         # e1 = self.encoder1(x)
+#         # e2 = self.encoder2(e1)
+#         e1 = self.maxpool(x)
+#         e2 = self.maxpool(e1)
+
+#         # Upsample
+#         d1 = self.gelu(self.bn1(self.decoder1(e2)))
+#         d1 = d1 + e1
+        
+#         d2 = self.gelu(self.bn2(self.decoder2(d1)))
+#         out = d2 + x
+
+#         return out
 
 @NECKS.register_module()
 class BEV3DFCN(nn.Module):

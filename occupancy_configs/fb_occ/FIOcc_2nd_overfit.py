@@ -6,10 +6,10 @@
 
 
 # we follow the online training settings  from solofusion
-num_gpus = 2
-samples_per_gpu = 24
-num_iters_per_epoch = int(28130 // (num_gpus * samples_per_gpu) * 4.554)
-num_epochs = 20
+num_gpus = 1
+samples_per_gpu = 10
+num_iters_per_epoch = int(120 // (num_gpus * samples_per_gpu) * 4.554) # full scene: 28130, triple scene: 120
+num_epochs = 100
 checkpoint_epoch_interval = 1
 use_custom_eval_hook = True
 
@@ -19,7 +19,7 @@ use_custom_eval_hook = True
 # lowering performance. To increase diversity, we split each training sequence
 # in half to ~20 keyframes, and sample these shorter sequences during training.
 # During testing, we do not do this splitting.
-train_sequences_split_num = 2
+train_sequences_split_num = 10
 test_sequences_split_num = 1
 
 # By default, 3D detection datasets randomly choose another sample if there is
@@ -94,7 +94,7 @@ bev_w_ = 100
 occ_h = 8
 numC_Trans=80
 back_dim_=256
-_dim_ = 128
+_dim_ = 80
 _pos_dim_ = 40
 _ffn_dim_ = numC_Trans * 4
 _num_heads_ = 8
@@ -119,7 +119,8 @@ model = dict(
     #history_cat_num=history_cat_num,
     single_bev_num_channels=numC_Trans,
     readd=True,
-    embed_dim=back_dim_,
+    embed_dim=_dim_,
+    n_queries=_num_queries_,
     attn_level=_num_levels_,
     grid_config = grid_config,
 
@@ -158,8 +159,13 @@ model = dict(
         grid_config=grid_config,
         input_size=data_config['input_size'],
         downsample=16,
-        accelerate=True
+        accelerate=False
     ),
+    frpn=None,
+
+    # keypoint=dict(
+    #     forward_channel=numC_Trans
+    # ),
 
     bev_fcn_encoder=dict(
         type='BEV2DFCN',
@@ -169,23 +175,75 @@ model = dict(
         out_channels=_dim_
     ),
 
-    occ_self_attn=dict(
+    inst_pos_embed=dict(
+        type='LearnableSqueezePositionalEncoding',
+        num_embeds=[_num_queries_],
+        embed_dims=_dim_,
+        squeeze_dims=[1]
+    ),
+
+    back_project=dict(
         type='DeformableTransformerLayer',
-        embed_dims=numC_Trans,
+        embed_dims=_dim_,
         num_heads=_num_heads_,
         num_levels=1,
-        num_points=8,
-        attn_layer='DeformableSqueezeAttention',
+        num_points=12,
+        grid_config=grid_config,
+        data_config=data_config,
+    ),
+
+    deform_cross_attn=dict(
+        type='DeformableTransformerLayer',
+        embed_dims=_dim_,
+        num_heads=_num_heads_,
+        num_levels=1,
+        num_points=12,
+        #attn_layer='DeformableSqueezeAttention',
         grid_config=grid_config,
         data_config=data_config,
     ),
 
     bev_pos_embed=dict(
         type='LearnableSqueezePositionalEncoding',
-        num_embeds=[50, 50, 4],
-        embed_dims=numC_Trans,
-        squeeze_dims=[1, 1, 1]
+        num_embeds=[100, 100],
+        embed_dims=_dim_,
+        squeeze_dims=[1, 1]
     ),
+
+    bev_inst_feat_cross_attn=dict(
+        type='TransformerLayer',
+        embed_dims=_dim_,
+        num_heads=_num_heads_,
+        mlp_ratio=0
+    ),
+
+    # bev_inst_h_cross_attn=dict(
+    #     type='TransformerLayer',
+    #     embed_dims=_dim_,
+    #     kdim=_dim_,
+    #     vdim=occ_h,
+    #     num_heads=_num_heads_,
+    #     mlp_ratio=0
+    # ),
+    # img_bev_encoder_backbone=dict(
+    #     type='CustomResNet3D',
+    #     depth=18,
+    #     with_cp=use_checkpoint,
+    #     block_strides=[1, 2, 2],
+    #     n_input_channels=numC_Trans,
+    #     block_inplanes=voxel_channels,
+    #     out_indices=voxel_out_indices,
+    #     norm_cfg=dict(type='SyncBN', requires_grad=True),
+    # ),
+    # img_bev_encoder_neck=dict(
+    #     type='FPN3D',
+    #     with_cp=use_checkpoint,
+    #     in_channels=voxel_channels,
+    #     out_channels=voxel_out_channel,
+    #     norm_cfg=dict(type='SyncBN', requires_grad=True),
+    # ),
+
+    backward_projection=None,
 
     occupancy_head= dict(
         type='OccHead',
@@ -293,7 +351,7 @@ share_data_config = dict(
 test_data_config = dict(
     pipeline=test_pipeline,
     sequences_split_num=test_sequences_split_num,
-    ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl')# 'bevdetv2-nuscenes_infos_val.pkl')
+    ann_file=data_root + 'single_scene_overfit.pkl') # bevdetv2-nuscenes_infos_val.pkl
 
 data = dict(
     samples_per_gpu=samples_per_gpu,
@@ -302,7 +360,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl',#'bevdetv2-nuscenes_infos_train.pkl'
+        ann_file=data_root + 'single_scene_overfit.pkl', # bevdetv2-nuscenes_infos_val.pkl
         pipeline=train_pipeline,
         classes=class_names,
         test_mode=False,

@@ -102,15 +102,10 @@ class FBOCC(CenterPoint):
         self.img_bev_encoder_neck = builder.build_neck(img_bev_encoder_neck) if img_bev_encoder_neck else None
 
         #FIOcc init
-        # self.inst_pos_embed = builder.build_neck(inst_pos_embed) if inst_pos_embed else None
-        self.channel_weight = None #nn.Parameter(torch.randn(keypoint['forward_channel']), requires_grad=False) if keypoint else None
         self.occ_self_attn = builder.build_neck(occ_self_attn) if occ_self_attn else None
         self.bev_pos_embed = builder.build_neck(bev_pos_embed) if bev_pos_embed else None
         
         #######For old config##############
-        self.fc1 = nn.Linear(80, 40, device='cuda') if n_queries else None
-        self.fc2 = nn.Linear(40, 8, device='cuda') if n_queries else None
-
         self.inst_queries = nn.Embedding(n_queries, embed_dim) if n_queries else None
         self.inst_ref_pts = nn.Embedding(n_queries, 3) if n_queries else None#and keypoint == None else None
         self.back_project = builder.build_neck(back_project) if back_project else None
@@ -120,6 +115,10 @@ class FBOCC(CenterPoint):
         self.bev_fcn3d_encoder = builder.build_neck(bev_fcn3d_encoder) if bev_fcn3d_encoder else None
         self.bev_fcn_encoder = builder.build_neck(bev_fcn_encoder) if bev_fcn_encoder else None
         self.gelu = nn.GELU()
+        # self.bev_2d_encoder_neck = builder.build_neck(bev_2d_encoder_neck) if bev_2d_encoder_neck else None   
+        # print("encoder_neck_complete")
+        # self.bev_2d_encoder_backbone = builder.build_backbone(bev_2d_encoder_backbone) if bev_2d_encoder_backbone else None
+        # print("encoder_backbone_complete")
 
         # FC layer
 
@@ -365,155 +364,83 @@ class FBOCC(CenterPoint):
         return_map = {}
 
         context = self.image_encoder(img[0])
-        # total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-        # print(f"Img_encdoer_param: {total_params}")
+
         cam_params = img[1:7]
         if self.with_specific_component('depth_net'):
-            # t=time.time()
             mlp_input = self.depth_net.get_mlp_input(*cam_params)
             context_depthnet, depth = self.depth_net(context, mlp_input)
-            # print(f"\nDepthNet time: {time.time()-t}")
-            # print(sum(p.numel() for p in self.depth_net.parameters() if p.requires_grad))
-            # total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-            # print(f"Depth_Net_Param: {total_params}")
             return_map['depth'] = depth
             return_map['context'] = context_depthnet
-            # depth_save = depth.cpu().numpy()
-            # np.save('depth.npy', depth_save)
-            # assert False
         else:
             context=None
             depth=None
         
         if self.with_specific_component('forward_projection'):
-            # t = time.time()
             bev_feat = self.forward_projection(cam_params, context_depthnet, depth, **kwargs)
-
-            # # find occupied
-            # occupied = self.fc0(bev_feat.permute(0,2,3,4,1))
-            # occupied = self.gelu(occupied).sigmoid()
-
-            # print(f"\nForwardTime: {time.time()-t}")
-            # total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-            # print(f"Forward_Prjection_Param: {total_params}")
-            
-            # print(occ_feat.shape)
-            # np.save('occ_feature.npy', bev_feat.cpu().numpy())
-            # assert False
-
-            # occ_feat = bev_feat
             return_map['cam_params'] = cam_params
         else:
             bev_feat = None
 
-
         if self.with_specific_component('bev_fcn_encoder'):
             # bev_feat.shape = bs, c, D, W, H => bs, c*H, D, W => bs, c_out, D, W
+            bs, c, d, w, h = bev_feat.shape
             bev_feat = bev_feat.permute(0, 4, 1, 2, 3).flatten(1, 2)
-            # print(f"bev_fcn_encoder: bev_feat = {bev_feat.shape}")
-            bev_feat = self.bev_fcn_encoder(bev_feat)
-            # total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-            # print(f"FCN_Param: {total_params}")
-            # print(f"bev_fcn_encoder: bev_feat = {bev_feat.shape}")
+            bev_feat = self.bev_fcn_encoder(bev_feat) # bevfeat = bs, C, D, W
+            in_C = bev_feat.shape[1]
+            # reconstruct height
+            norm1 = nn.BatchNorm2d(int(c * h/2), device='cuda')
+            norm2 = nn.BatchNorm2d(c * h, device='cuda')
+            heightconv1 = nn.Conv2d(in_channels=in_C, out_channels= int(c * h/2), kernel_size=1, device='cuda')
+            heightconv2 = nn.Conv2d(in_channels= int(c * h/2), out_channels=c * h, kernel_size=1, device='cuda')
+            bev_feat = self.gelu(norm1(heightconv1(bev_feat)))
+            bev_feat = self.gelu(norm2(heightconv2(bev_feat)))
+            # bev_feat = bs, c, d, w, h => bs, c, dwh
+            bev_feat = bev_feat.reshape(bs, h, c, d, w).permute(0, 2, 3, 4, 1)
 
-        if self.with_specific_component('frpn'): # not used in FB-OCC
-            bev_mask_logit = self.frpn(bev_feat)
-            bev_mask = bev_mask_logit.sigmoid() > self.frpn.mask_thre
-            
-            if bev_mask.requires_grad: # during training phase
-                gt_bev_mask = kwargs['gt_bev_mask'].to(torch.bool)
-                bev_mask = gt_bev_mask | bev_mask
-            return_map['bev_mask_logit'] = bev_mask_logit    
-        else:
-            bev_mask = None
-
-
-        ###############back project for FIOcc, named defrom_Cross attn###########
-        if self.with_specific_component('deform_cross_attn'):
-
-            bs, _, _, h, w = context_depthnet.shape
+        if self.with_specific_component('occ_self_attn'):
+            maxpool = nn.MaxPool3d(kernel_size=3, stride=2, padding=1)
+            # avgpool = nn.AvgPool3d(kernel_size=3, stride=2, padding=1)
+            upsample = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=True)
+    
+            bev_feat = maxpool(bev_feat).flatten(2)
+            bev_feat = bev_feat.permute(0, 2, 1)
 
             spatial_shapes = []
-            
-            spatial_shape = (h, w)
-            # feat_flatten = context.flatten(3).permute(1, 0, 3, 2)
+            spatial_shape = (int(d/2), int(w/2), int(h/2))
             spatial_shapes.append(spatial_shape)
-
             spatial_shapes = torch.as_tensor(
                 spatial_shapes, dtype=torch.long, device=context.device)
             level_start_index = torch.cat((spatial_shapes.new_zeros(
                 (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
 
-            D = self.grid_config['x']
-            D = int((D[1] - D[0]) / D[-1])
+            occ_pos = self.bev_pos_embed().repeat(bs, 1, 1)
 
-            W = self.grid_config['y']
-            W = int((W[1] - W[0]) / W[-1])
 
-            H = self.grid_config['z']
-            H = int((H[1] - H[0]) / H[-1])  
-
-            inst_queries = self.inst_queries.weight.repeat(bs, 1, 1)
-
-            inst_ref_pts = self.inst_ref_pts.weight
-            inst_ref_pts = inst_ref_pts.unsqueeze(0).repeat(bs, 1, 1)
-
-            inst_queries, voxel_ref_3d = self.deform_cross_attn(
-                inst_queries,
-                context_depthnet,
-                #query_pos = inst_pos,
-                ref_pts = inst_ref_pts,
-                img_value = True,
-                spatial_shapes = spatial_shapes,
-                level_start_index = level_start_index,
-                cam_params = cam_params,
-            )
-    
-
-        ###########1st version bev_inst_cross################################
-        if self.with_specific_component('bev_inst_feat_cross_attn'):
-
-            bev_pos = self.bev_pos_embed().repeat(bs, 1, 1)
-
-            spatial_shapes = []
-
-            bs, c, H, W = bev_feat.shape
-            bev_feat = bev_feat.flatten(2).permute(0, 2, 1)
-
-            for level in range(self.num_levels):
-                bev_feat = self.bev_inst_feat_cross_attn(
+            depth, width, height = d/2, w/2, h/2
+            x_coords = torch.arange(depth, dtype=torch.float32)
+            y_coords = torch.arange(width, dtype=torch.float32)
+            z_coords = torch.arange(height, dtype=torch.float32)
+            x_grid, y_grid, z_grid = torch.meshgrid(x_coords, y_coords, z_coords, indexing='ij')
+            ref_pts = torch.stack([x_grid, y_grid, z_grid], dim=-1).reshape(-1, 3)\
+                .unsqueeze(0).repeat(bs, 1, 1).to(bev_feat.device)
+            
+            for _ in range(3):
+                bev_feat = self.occ_self_attn(
                     bev_feat,
-                    inst_queries,
-                    inst_queries,
-                    query_pos = bev_pos,
-                    # key_pos = inst_pos,
+                    bev_feat,
+                    query_pos = occ_pos,
+                    ref_pts = ref_pts,
+                    occ_value = True,
+                    spatial_shapes = spatial_shapes,
+                    level_start_index = level_start_index,
+                    cam_params = cam_params,
+                    occ_size = [d, w, h]
                 )
-            bev_height = self.gelu(self.fc1(bev_feat))
-            bev_height = self.gelu(self.fc2(bev_height))
-
-            bev_height = bev_height.unsqueeze(-1)
-            bev_feat = bev_feat.unsqueeze(2)
-            result = bev_feat * bev_height
-            result = result.reshape(bs, H, W, -1, c)
-            # result = norm(upsample(bev_feat))
-
-            bev_feat = [result.permute(0, 4, 1, 2, 3)] # bs, C, D, W, H
+            
+            bev_feat = bev_feat.permute(0, 2, 1).reshape(bs, c, int(d/2), int(w/2), int(h/2)) 
+            bev_feat = [upsample(bev_feat)] # bs, C, D, W, H
 
 #######################################################################################################
-        if self.with_specific_component('backward_projection'):
-
-            bev_feat_refined = self.backward_projection([context],
-                                        img_metas,
-                                        lss_bev=bev_feat.mean(-1),
-                                        cam_params=cam_params,
-                                        bev_mask=bev_mask,
-                                        gt_bboxes_3d=None, # debug
-                                        pred_img_depth=depth)  
-                                        
-            if self.readd:
-                bev_feat = bev_feat_refined[..., None] + bev_feat
-            else:
-                bev_feat = bev_feat_refined
 
         # Fuse History
         # bev_feat = self.fuse_history(bev_feat, img_metas, img[6])
