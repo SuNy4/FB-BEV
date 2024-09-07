@@ -49,10 +49,10 @@ class BEV2DFCN(nn.Module):
         # self.bn_flat0 = nn.BatchNorm2d(self.in_channels*height/2)
         self.bn_flat1 = nn.BatchNorm2d(out_channels)
         self.gelu = nn.GELU()
-        self.encoder1 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1)
-        self.encoder2 = nn.Conv2d(out_channels, out_channels, kernel_size=3, stride=2, padding=1)
-        self.decoder1 = UpsampleLayer(2, 'bilinear')
-        self.decoder2 = UpsampleLayer(2, 'bilinear')
+        self.encoder1 = nn.Conv2d(out_channels, out_channels*2, kernel_size=3, stride=2, padding=1)
+        self.encoder2 = nn.Conv2d(out_channels*2, out_channels*4, kernel_size=3, stride=2, padding=1)
+        self.decoder1 = UpsampleLayer(2, 'bilinear', in_channels=out_channels*4, out_channels=out_channels*2, convtype='2d')
+        self.decoder2 = UpsampleLayer(2, 'bilinear', in_channels=out_channels*2, out_channels=out_channels, convtype='2d')
         # self.encoder1 = AggregationBlock(out_channels, out_channels*2)
         # self.encoder2 = AggregationBlock(out_channels*2, out_channels*4)
         
@@ -60,8 +60,10 @@ class BEV2DFCN(nn.Module):
         # self.decoder2 = nn.ConvTranspose2d(out_channels*2, out_channels, padding=1, kernel_size=4, stride=2)
         
         # Batch Normalization
-        self.bn1 = nn.BatchNorm2d(out_channels)
-        self.bn2 = nn.BatchNorm2d(out_channels)
+        self.bn1 = nn.BatchNorm2d(out_channels*2)
+        self.bn2 = nn.BatchNorm2d(out_channels*4)
+        self.bn3 = nn.BatchNorm2d(out_channels*2)
+        self.bn4 = nn.BatchNorm2d(out_channels)
 
     def forward(self, x):
         if self.flatten_height:
@@ -76,15 +78,14 @@ class BEV2DFCN(nn.Module):
         e2 = self.gelu(self.bn2(self.encoder2(e1))) #25
 
         # Upsample
-        d1 = self.decoder1(e2) #50
+        d1 = self.gelu(self.bn3(self.decoder1(e2))) #50
         d1 = d1 + e1
-        
-        d2 = self.decoder2(d1)
+        d2 = self.gelu(self.bn4(self.decoder2(d1)))
         out = d2 + x
 
         return out
 
-####### Original FCN2D ################
+######## Original FCN2D ################
 # @NECKS.register_module()
 # class BEV2DFCN(nn.Module):
 #     def __init__(self, flatten_height, height, in_channels, out_channels):
@@ -99,12 +100,7 @@ class BEV2DFCN(nn.Module):
 #         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
 #         self.decoder1 = UpsampleLayer(2, 'bilinear', out_channels, out_channels, convtype='2d')
 #         self.decoder2 = UpsampleLayer(2, 'bilinear', out_channels, out_channels, convtype='2d')
-#         # self.encoder1 = AggregationBlock(out_channels, out_channels*2)
-#         # self.encoder2 = AggregationBlock(out_channels*2, out_channels*4)
-        
-#         # self.decoder1 = nn.ConvTranspose2d(out_channels*4, out_channels*2, padding=1, kernel_size=4, stride=2)
-#         # self.decoder2 = nn.ConvTranspose2d(out_channels*2, out_channels, padding=1, kernel_size=4, stride=2)
-        
+
 #         # Batch Normalization
 #         self.bn1 = nn.BatchNorm2d(out_channels)
 #         self.bn2 = nn.BatchNorm2d(out_channels)
@@ -167,3 +163,21 @@ class BEV3DFCN(nn.Module):
         out = d2 + x
 
         return out
+    
+@NECKS.register_module()
+class OcclusionMask(nn.Module):
+    def __init__(self, in_channel):
+        super(OcclusionMask, self).__init__()
+        self.in_channel = in_channel
+        self.gelu = nn.GELU()
+        # self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True)
+        self.bn = nn.BatchNorm3d(in_channel)
+
+    def forward(self, input):
+        
+        mask = self.bn(input).sum(dim=1)
+        mask = self.gelu(mask)
+        mask = mask <= 0.7
+        mask = torch.any(mask, dim=-1)
+
+        return mask 

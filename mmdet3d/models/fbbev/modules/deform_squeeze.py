@@ -79,15 +79,18 @@ class DeformableSqueezeAttention(nn.Module):
 
     def squeeze_value_by_axis(self, value, reference_points, spatial_shapes, squeeze_axis):
         bs, _, embed_dims = value.shape
-
+        target = reference_points.size(-1) - squeeze_axis - 1
         spatial_shapes_ = spatial_shapes.clone()
-        spatial_shapes_[:, reference_points.size(-1) - squeeze_axis - 1] *= spatial_shapes_[:, -1]
+        spatial_shapes_[:, target] *= spatial_shapes_[:, -1]
         spatial_shapes_ = spatial_shapes_[:, :-1]
 
-        reference_points_ = reference_points.clone()
-        reference_points_[..., squeeze_axis] += ((reference_points_[..., 0] - 0.5) /
-                                                 spatial_shapes[:, squeeze_axis])
-        reference_points_ = reference_points_[..., 1:]
+        reference_points_ = reference_points#.clone()
+        
+        reference_points_[..., target] *= spatial_shapes[:, -1]
+        reference_points_[..., target] += reference_points_[..., squeeze_axis]
+        reference_points_[..., target].sigmoid()
+        reference_points_ = reference_points_[..., :2]
+
         # assert (reference_points_[..., squeeze_axis].max() <
         #         1) and (reference_points_[..., squeeze_axis].min() > 0)
 

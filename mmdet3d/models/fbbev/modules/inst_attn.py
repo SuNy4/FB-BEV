@@ -85,6 +85,27 @@ class DeformableTransformerLayer(nn.Module):
             nn.GELU(),
             nn.Linear(embed_dims * mlp_ratio, embed_dims),
         )
+        
+    def generate_grid(self, grid_shape, value=None, offset=0, normalize=False):
+        """
+        Args:
+            grid_shape: The (scaled) shape of grid.
+            value: The (unscaled) value the grid represents.
+        Returns:
+            Grid coordinates of shape [len(grid_shape), *grid_shape]
+        """
+        if value is None:
+            value = grid_shape
+        grid = []
+        for i, (s, val) in enumerate(zip(grid_shape, value)):
+            g = torch.linspace(offset, val - 1 + offset, s, dtype=torch.float)
+            if normalize:
+                g /= s - 1
+            shape_ = [1 for _ in grid_shape]
+            shape_[i] = s
+            g = g.reshape(1, *shape_).expand(1, *grid_shape)
+            grid.append(g)
+        return torch.cat(grid, dim=0)
 
     def get_reference_points(self, coords, dim='3d', device='cuda', dtype=torch.float):
         """Get the reference points used in SCA and TSA.
@@ -219,7 +240,6 @@ class DeformableTransformerLayer(nn.Module):
                 device='cuda', 
                 dtype=torch.float
                 )
-            voxel_ref_3d=None
             
             # voxel_ref_3d = self.get_reference_points(
             #     coords=ref_pts,
@@ -302,7 +322,7 @@ class DeformableTransformerLayer(nn.Module):
                     index_query_per_img = indexes[j][i]
                     output[j, index_query_per_img] = query_per_cam[j, :len(index_query_per_img)]
 
-            return output, voxel_ref_3d
+            return output
         
         else:
             return query
