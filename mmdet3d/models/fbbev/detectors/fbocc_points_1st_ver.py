@@ -62,6 +62,7 @@ class FBOCC(CenterPoint):
                  attn_level=None,
                  grid_config=None,
                  bev_fcn3d_encoder=None,
+                 occlusion_mask=None,
 
                  occ_self_attn=None,
                  keypoint=None,
@@ -95,6 +96,7 @@ class FBOCC(CenterPoint):
         self.fix_void = fix_void
         self.num_levels = attn_level
         self.grid_config = grid_config
+        self.occ_mesh = grid_config['x']
       
         # BEVDet init
         self.forward_projection = builder.build_neck(forward_projection) if forward_projection else None
@@ -102,17 +104,27 @@ class FBOCC(CenterPoint):
         self.img_bev_encoder_neck = builder.build_neck(img_bev_encoder_neck) if img_bev_encoder_neck else None
 
         #FIOcc init
+        # self.inst_pos_embed = builder.build_neck(inst_pos_embed) if inst_pos_embed else None
+        self.channel_weight = None #nn.Parameter(torch.randn(keypoint['forward_channel']), requires_grad=False) if keypoint else None
         self.occ_self_attn = builder.build_neck(occ_self_attn) if occ_self_attn else None
         self.bev_pos_embed = builder.build_neck(bev_pos_embed) if bev_pos_embed else None
-        
-        #######For old config##############
+        # self.occlusion_mask = builder.build_neck(occlusion_mask) if occlusion_mask else None
+        # self.fc0 = nn.Linear(80, 1, device='cuda') if n_queries else None
+        # self.fc1 = nn.Linear(256, 128, device='cuda') if keypoint else None
+        # self.fc2 = nn.Linear(128, 80, device='cuda') if keypoint else None
+        self.conv1 = nn.Conv2d(in_channels=128, out_channels=640, kernel_size=1, stride=1)
+        self.bn = nn.BatchNorm3d(80)
+        # #######For old config##############   
+        # self.fc1 = nn.Linear(80, 40, device='cuda') if n_queries else None
+        # self.fc2 = nn.Linear(40, 8, device='cuda') if n_queries else None
+
         self.inst_queries = nn.Embedding(n_queries, embed_dim) if n_queries else None
-        self.inst_ref_pts = nn.Embedding(n_queries, 3) if n_queries else None#and keypoint == None else None
+        #self.inst_ref_pts = nn.Embedding(n_queries, 3) if n_queries else None #and keypoint == None else None
         self.back_project = builder.build_neck(back_project) if back_project else None
         self.deform_cross_attn = builder.build_neck(deform_cross_attn) if deform_cross_attn else None
         #self.bev_inst_h_cross_attn = builder.build_neck(bev_inst_h_cross_attn) if bev_inst_h_cross_attn else None
         self.bev_inst_feat_cross_attn = builder.build_neck(bev_inst_feat_cross_attn) if bev_inst_feat_cross_attn else None
-        self.bev_fcn3d_encoder = builder.build_neck(bev_fcn3d_encoder) if bev_fcn3d_encoder else None
+        # self.bev_fcn3d_encoder = builder.build_neck(bev_fcn3d_encoder) if bev_fcn3d_encoder else None
         self.bev_fcn_encoder = builder.build_neck(bev_fcn_encoder) if bev_fcn_encoder else None
         self.gelu = nn.GELU()
         # self.bev_2d_encoder_neck = builder.build_neck(bev_2d_encoder_neck) if bev_2d_encoder_neck else None   
@@ -364,9 +376,11 @@ class FBOCC(CenterPoint):
         return_map = {}
 
         context = self.image_encoder(img[0])
-
+        # total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
+        # print(f"Img_encdoer_param: {total_params}")
         cam_params = img[1:7]
         if self.with_specific_component('depth_net'):
+            # t=time.time()
             mlp_input = self.depth_net.get_mlp_input(*cam_params)
             context_depthnet, depth = self.depth_net(context, mlp_input)
             return_map['depth'] = depth
@@ -380,61 +394,102 @@ class FBOCC(CenterPoint):
             return_map['cam_params'] = cam_params
         else:
             bev_feat = None
+        
+        if self.with_specific_component('occlusion_mask'):
+            # occlusion_mask: bs, D, W tensor boolean map
+            occlusion_mask = self.occlusion_mask(bev_feat)
+            upsampled = F.interpolate(occlusion_mask.float().unsqueeze(0), scale_factor=2, mode='nearest').squeeze(0).bool()
+            return_map['occlusion_mask'] = upsampled
 
         if self.with_specific_component('bev_fcn_encoder'):
             # bev_feat.shape = bs, c, D, W, H => bs, c*H, D, W => bs, c_out, D, W
-            bs, c, d, w, h = bev_feat.shape
+            bs, c, D, W, H = bev_feat.shape
             bev_feat = bev_feat.permute(0, 4, 1, 2, 3).flatten(1, 2)
-            bev_feat = self.bev_fcn_encoder(bev_feat) # bevfeat = bs, C, D, W
-            in_C = bev_feat.shape[1]
-            # reconstruct height
-            norm1 = nn.BatchNorm2d(int(c * h/2), device='cuda')
-            norm2 = nn.BatchNorm2d(c * h, device='cuda')
-            heightconv1 = nn.Conv2d(in_channels=in_C, out_channels= int(c * h/2), kernel_size=1, device='cuda')
-            heightconv2 = nn.Conv2d(in_channels= int(c * h/2), out_channels=c * h, kernel_size=1, device='cuda')
-            bev_feat = self.gelu(norm1(heightconv1(bev_feat)))
-            bev_feat = self.gelu(norm2(heightconv2(bev_feat)))
-            # bev_feat = bs, c, d, w, h => bs, c, dwh
-            bev_feat = bev_feat.reshape(bs, h, c, d, w).permute(0, 2, 3, 4, 1)
+            if self.with_specific_component('occlusion_mask'): 
+                bev_feat = bev_feat * occlusion_mask.unsqueeze(1)
+            bev_feat = self.bev_fcn_encoder(bev_feat)
+            bev_feat = self.gelu(self.bn(self.conv1(bev_feat).reshape(bs, H, c, D, W).permute(0, 2, 3, 4, 1)))
 
-        if self.with_specific_component('occ_self_attn'):
-            maxpool = nn.MaxPool3d(kernel_size=3, stride=2, padding=1)
-            # avgpool = nn.AvgPool3d(kernel_size=3, stride=2, padding=1)
-            upsample = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=True)
-    
-            bev_feat = maxpool(bev_feat).flatten(2)
-            bev_feat = bev_feat.permute(0, 2, 1)
+        ### back project for 2nd version FIOcc##############
+        if self.with_specific_component('back_project'):
+
+            bs, _, _, h, w = context_depthnet.shape
 
             spatial_shapes = []
-            spatial_shape = (int(d/2), int(w/2), int(h/2))
+            
+            spatial_shape = (h, w)
             spatial_shapes.append(spatial_shape)
+
             spatial_shapes = torch.as_tensor(
                 spatial_shapes, dtype=torch.long, device=context.device)
             level_start_index = torch.cat((spatial_shapes.new_zeros(
                 (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
 
-            occ_pos = self.bev_pos_embed().repeat(bs, 1, 1)
+            inst_queries = self.inst_queries.weight.repeat(bs, 1, 1)
 
-            ref_pts = self.occ_self_attn.generate_grid(list(spatial_shape), normalize=True).to(device=bev_feat.device)
+            grid_coord = self.back_project.generate_grid([D, W, H], normalize=True).to(device=bev_feat.device)
+            grid_coord = grid_coord.permute(1, 2, 3, 0).unsqueeze(0).repeat(bs, 1, 1, 1, 1)
+            
+            bev_feat = bev_feat.flatten(2).permute(0, 2, 1) # bs, c, D, W, H => bs, DWH, c
+            inst_ref_pts = torch.matmul(inst_queries, bev_feat.permute(0, 2, 1)) # bs, N_que, C => bs, N_que, DWH
+            inst_ref_pts = torch.matmul(inst_ref_pts, grid_coord.flatten(1, 3)) # bs, N_que, DWH => bs, N_que, 3
 
-            ref_pts = ref_pts.flatten(1).transpose(0, 1).contiguous()
-            ref_pts = ref_pts.unsqueeze(0).expand(bs, -1, -1)
+            inst_queries = self.back_project(
+                inst_queries,
+                context_depthnet,
+                ref_pts = inst_ref_pts,
+                img_value = True,
+                spatial_shapes = spatial_shapes,
+                level_start_index = level_start_index,
+                cam_params = cam_params,
+            )
 
-            for _ in range(3):
-                bev_feat = self.occ_self_attn(
+        ###### 3rd version FIOcc bev_inst_attn(3D query 50 50 4) #######
+        if self.with_specific_component('bev_inst_feat_cross_attn'):
+            # maxpool = nn.MaxPool3d(kernel_size=3, stride=2, padding=1)
+            # norm = nn.BatchNorm3d(80, device='cuda')
+            # upsample = nn.Upsample(scale_factor=2, mode='trilinear')
+            # bev_feat = norm(maxpool(bev_feat))
+            
+            bev_pos = self.bev_pos_embed().repeat(bs, 1, 1)
+
+            spatial_shapes = []
+            spatial_shape = (D, W, H)
+            # feat_flatten = context.flatten(3).permute(1, 0, 3, 2)
+            spatial_shapes.append(spatial_shape)
+
+            spatial_shapes = torch.as_tensor(
+                spatial_shapes, dtype=torch.long, device=context.device)
+            level_start_index = torch.cat((spatial_shapes.new_zeros(
+                (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+            
+            bev_feat_que = bev_feat
+
+            for level in range(self.num_levels):
+                inst_queries = self.deform_cross_attn(
+                    inst_queries,
                     bev_feat,
-                    bev_feat,
-                    query_pos = occ_pos,
-                    ref_pts = ref_pts,
+                    ref_pts = inst_ref_pts,
                     occ_value = True,
                     spatial_shapes = spatial_shapes,
                     level_start_index = level_start_index,
                     cam_params = cam_params,
-                    occ_size = [d, w, h]
-                )
-            
-            bev_feat = bev_feat.permute(0, 2, 1).reshape(bs, c, int(d/2), int(w/2), int(h/2)) 
-            bev_feat = [upsample(bev_feat)] # bs, C, D, W, H
+                    )
+                
+                bev_feat = self.bev_inst_feat_cross_attn(
+                    bev_feat,
+                    inst_queries,
+                    inst_queries,
+                    query_pos = bev_pos,
+                    )
+        
+            if self.readd:
+                bev_feat = bev_feat + bev_feat_que
+
+            bev_feat = bev_feat.permute(0, 2, 1).reshape(bs, c, D, W, H)
+            # result = upsample(bev_feat)
+
+            bev_feat = [bev_feat] # bs, C, D, W, H
 
 #######################################################################################################
 
