@@ -4,6 +4,6 @@ from .fpn3d import FPN3D
 from .resnet3d import CustomResNet3D
 from .occ_loss_utils import *
 from .inst_attn import *
-from .fcn import BEV2DFCN, BEV3DFCN
+from .fcn import BEV2DFCN, BEV3DFCN, OcclusionMask
 from .pos_embed import LearnableSqueezePositionalEncoding
 from .deform_squeeze import DeformableSqueezeAttention

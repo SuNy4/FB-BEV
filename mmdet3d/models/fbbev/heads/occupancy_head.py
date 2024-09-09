@@ -40,6 +40,7 @@ class OccHead(BaseModule):
         with_cp=False,
         use_focal_loss=False,
         use_dice_loss= False,
+        use_bev_dice_loss=False,
         use_deblock=True,
     ):
         super(OccHead, self).__init__()
@@ -111,7 +112,8 @@ class OccHead(BaseModule):
             
         # loss functions
         self.use_dice_loss = use_dice_loss
-        if self.use_dice_loss:
+        self.use_bev_dice_loss = use_bev_dice_loss
+        if self.use_dice_loss or self.use_bev_dice_loss:
             self.dice_loss = builder.build_loss(dict(type='DiceLoss', loss_weight=2))
 
         if balance_cls_weight:
@@ -205,13 +207,13 @@ class OccHead(BaseModule):
         loss = self.loss(target_voxels=gt_occupancy,
             output_voxels = res['output_voxels'],
             output_coords_fine=res['output_coords_fine'],
-            output_voxels_fine=res['output_voxels_fine'])
+            output_voxels_fine=res['output_voxels_fine'], **kwargs)
 
         return loss
 
 
     @force_fp32() 
-    def loss_voxel(self, output_voxels, target_voxels, tag):
+    def loss_voxel(self, output_voxels, target_voxels, tag, **kwargs):
 
         # resize gt                       
         B, C, H, W, D = output_voxels.shape
@@ -254,6 +256,14 @@ class OccHead(BaseModule):
             visible_target_voxels = F.one_hot(visible_target_voxels.to(torch.long), 19)
             loss_dict['loss_voxel_dice_{}'.format(tag)] = self.dice_loss(visible_pred_voxels, visible_target_voxels)
 
+        if self.use_bev_dice_loss:
+            visible_mask = target_voxels
+            visible_mask[visible_mask != 255] = True
+            visible_mask[visible_mask == 255] = False
+            visible_mask = torch.any(visible_mask, dim=-1)
+            mask = kwargs['results']['occlusion_mask']
+            loss_dict['loss_bev_dice_{}'.format(tag)] = self.dice_loss(mask, visible_mask)
+
         return loss_dict
 
     @force_fp32() 
@@ -262,5 +272,5 @@ class OccHead(BaseModule):
                 target_voxels=None, visible_mask=None, **kwargs):
         loss_dict = {}
         for index, output_voxel in enumerate(output_voxels):
-            loss_dict.update(self.loss_voxel(output_voxel, target_voxels,  tag='c_{}'.format(index)))
+            loss_dict.update(self.loss_voxel(output_voxel, target_voxels,  tag='c_{}'.format(index), **kwargs))
         return loss_dict
