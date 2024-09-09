@@ -112,8 +112,10 @@ class FBOCC(CenterPoint):
         # self.fc0 = nn.Linear(80, 1, device='cuda') if n_queries else None
         # self.fc1 = nn.Linear(256, 128, device='cuda') if keypoint else None
         # self.fc2 = nn.Linear(128, 80, device='cuda') if keypoint else None
-        self.conv1 = nn.Conv2d(in_channels=128, out_channels=640, kernel_size=1, stride=1)
-        self.bn = nn.BatchNorm3d(80)
+        self.conv1 = nn.Conv2d(in_channels=128, out_channels=80, kernel_size=1, stride=1)
+        self.conv2 = nn.Conv2d(in_channels=80, out_channels=8, kernel_size=1, stride=1)
+        self.bn1 = nn.BatchNorm3d(80)
+        self.bn2 = nn.BatchNorm3d(8)
         # #######For old config##############   
         # self.fc1 = nn.Linear(80, 40, device='cuda') if n_queries else None
         # self.fc2 = nn.Linear(40, 8, device='cuda') if n_queries else None
@@ -408,7 +410,9 @@ class FBOCC(CenterPoint):
             if self.with_specific_component('occlusion_mask'): 
                 bev_feat = bev_feat * occlusion_mask.unsqueeze(1)
             bev_feat = self.bev_fcn_encoder(bev_feat)
-            bev_feat = self.gelu(self.bn(self.conv1(bev_feat).reshape(bs, H, c, D, W).permute(0, 2, 3, 4, 1)))
+            bev_feat = self.gelu(self.bn1(self.conv1(bev_feat))) # bs, C, D, W
+            bev_h = self.gelu(self.bn2(self.conv2(bev_feat))).permute(0, 2, 3, 1) # bs, H, D, W => bs, D, W, H
+            bev_feat = bev_feat.unsqueeze(-1) * bev_h.unsqueeze(1)
 
         ### back project for 2nd version FIOcc##############
         if self.with_specific_component('back_project'):
