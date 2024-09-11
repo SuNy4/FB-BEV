@@ -202,6 +202,7 @@ class LoadOccupancy(object):
         ###############
         if self.fix_void:
             occupancy[occupancy<255] = occupancy[occupancy<255] + 1
+            occupancy[occupancy==255] = 0
         ###############
 
         for class_ in self.ignore_classes:
