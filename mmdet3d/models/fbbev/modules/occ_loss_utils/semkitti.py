@@ -179,6 +179,21 @@ def CE_ssc_loss(pred, target, class_weights=None, ignore_index=255):
 
     return loss
 
+def BCE_ssc_loss(pred, target, class_weights=None, ignore_index=255):
+    """
+    :param: prediction: the predicted tensor, must be [BS, C, ...]
+    """
+
+    # Target: bs, D, W, H
+    gt = target
+    gt[gt != 0] = 1
+    criterion = nn.BCELoss()
+
+    with autocast(False):
+        loss = criterion(pred, gt.unsqueeze(1).float())
+
+    return loss
+
 def vel_loss(pred, gt):
     with autocast(False):
         return F.l1_loss(pred, gt)

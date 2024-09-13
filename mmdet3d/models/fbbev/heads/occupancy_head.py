@@ -14,7 +14,7 @@ from mmdet.models import HEADS
 from mmcv.cnn import build_conv_layer, build_norm_layer, build_upsample_layer
 from mmdet3d.models.fbbev.modules.occ_loss_utils import lovasz_softmax, CustomFocalLoss
 from mmdet3d.models.fbbev.modules.occ_loss_utils import nusc_class_frequencies, nusc_class_names
-from mmdet3d.models.fbbev.modules.occ_loss_utils import geo_scal_loss, sem_scal_loss, CE_ssc_loss
+from mmdet3d.models.fbbev.modules.occ_loss_utils import geo_scal_loss, sem_scal_loss, CE_ssc_loss, BCE_ssc_loss
 from torch.utils.checkpoint import checkpoint as cp
 from mmcv.runner import BaseModule, force_fp32
 from torch.cuda.amp import autocast
@@ -239,15 +239,19 @@ class OccHead(BaseModule):
         loss_dict = {}
 
         # igore 255 = ignore noise. we keep the loss bascward for the label=0 (free voxels)
+
         if self.use_focal_loss:
             loss_dict['loss_voxel_ce_{}'.format(tag)] = self.loss_voxel_ce_weight * self.focal_loss(output_voxels, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=0) # ignore Occluded
         else:
             loss_dict['loss_voxel_ce_{}'.format(tag)] = self.loss_voxel_ce_weight * CE_ssc_loss(output_voxels, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=255)
 
         loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = self.loss_voxel_sem_scal_weight * sem_scal_loss(output_voxels, target_voxels, ignore_index=0) # Check only 1~17 classes
-        loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=0, non_empty_idx=self.empty_idx) # Check Free area
+        loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = (self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=0, non_empty_idx=self.empty_idx) + 
+                                                           self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=0)) / 2 # Check Free area
         #####
-        loss_dict['loss_voxel_unknown_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=0) # Check occluded area
+        # Check Occluded Area
+        # loss_dict['loss_voxel_unknown_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=0)
+        loss_dict['loss_voxel_unknown_ce_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * BCE_ssc_loss(kwargs['results']['unknown'], target_voxels)                                               
         #####
         loss_dict['loss_voxel_lovasz_{}'.format(tag)] = self.loss_voxel_lovasz_weight * lovasz_softmax(torch.softmax(output_voxels, dim=1), target_voxels, ignore=0) 
 

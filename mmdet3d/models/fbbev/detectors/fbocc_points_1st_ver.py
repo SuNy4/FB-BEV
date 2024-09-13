@@ -119,6 +119,9 @@ class FBOCC(CenterPoint):
         # #######For old config##############   
         # self.fc1 = nn.Linear(80, 40, device='cuda') if n_queries else None
         # self.fc2 = nn.Linear(40, 8, device='cuda') if n_queries else None
+        
+        self.maxpool3d = nn.MaxPool3d(kernel_size=2, stride=2, padding=0)
+        self.upsample3d = nn.Upsample(scale_factor=2, mode='trilinear')
 
         self.inst_queries = nn.Embedding(n_queries, embed_dim) if n_queries else None
         #self.inst_ref_pts = nn.Embedding(n_queries, 3) if n_queries else None #and keypoint == None else None
@@ -384,15 +387,15 @@ class FBOCC(CenterPoint):
         if self.with_specific_component('depth_net'):
             # t=time.time()
             mlp_input = self.depth_net.get_mlp_input(*cam_params)
-            context_depthnet, depth = self.depth_net(context, mlp_input)
+            context, depth = self.depth_net(context, mlp_input)
             return_map['depth'] = depth
-            return_map['context'] = context_depthnet
+            return_map['context'] = context
         else:
             context=None
             depth=None
         
         if self.with_specific_component('forward_projection'):
-            bev_feat = self.forward_projection(cam_params, context_depthnet, depth, **kwargs)
+            bev_feat = self.forward_projection(cam_params, context, depth, **kwargs)
             return_map['cam_params'] = cam_params
         else:
             bev_feat = None
@@ -410,14 +413,22 @@ class FBOCC(CenterPoint):
             if self.with_specific_component('occlusion_mask'): 
                 bev_feat = bev_feat * occlusion_mask.unsqueeze(1)
             bev_feat = self.bev_fcn_encoder(bev_feat)
+
             bev_feat = self.gelu(self.bn1(self.conv1(bev_feat))) # bs, C, D, W
             bev_h = self.gelu(self.bn2(self.conv2(bev_feat))).permute(0, 2, 3, 1) # bs, H, D, W => bs, D, W, H
-            bev_feat = bev_feat.unsqueeze(-1) * bev_h.unsqueeze(1)
+            bev_h = bev_h.unsqueeze(1).sigmoid()
+            
+            bev_feat = bev_feat.unsqueeze(-1) * bev_h # bs, C, D, W, H
+            return_map['unknown'] = self.upsample3d(bev_h)
+            
+            # For 50x50x4
+            # bev_feat = self.maxpool3d(bev_feat)
+            _, _, D, W, H = bev_feat.shape
 
         ### back project for 2nd version FIOcc##############
         if self.with_specific_component('back_project'):
 
-            bs, _, _, h, w = context_depthnet.shape
+            bs, _, _, h, w = context.shape
 
             spatial_shapes = []
             
@@ -436,11 +447,15 @@ class FBOCC(CenterPoint):
             
             bev_feat = bev_feat.flatten(2).permute(0, 2, 1) # bs, c, D, W, H => bs, DWH, c
             inst_ref_pts = torch.matmul(inst_queries, bev_feat.permute(0, 2, 1)) # bs, N_que, C => bs, N_que, DWH
-            inst_ref_pts = torch.matmul(inst_ref_pts, grid_coord.flatten(1, 3)) # bs, N_que, DWH => bs, N_que, 3
+            
+            # Get most related point
+            _, indice = torch.softmax(inst_ref_pts, dim = -1).max(dim=-1, keepdim=True)
+            one_hot_point = torch.zeros_like(inst_ref_pts).scatter_(-1, indice, 1)
+            inst_ref_pts = torch.matmul(one_hot_point, grid_coord.flatten(1, 3)) # bs, N_que, DWH => bs, N_que, 3
 
             inst_queries = self.back_project(
                 inst_queries,
-                context_depthnet,
+                context,
                 ref_pts = inst_ref_pts,
                 img_value = True,
                 spatial_shapes = spatial_shapes,
@@ -491,7 +506,8 @@ class FBOCC(CenterPoint):
                 bev_feat = bev_feat + bev_feat_que
 
             bev_feat = bev_feat.permute(0, 2, 1).reshape(bs, c, D, W, H)
-            # result = upsample(bev_feat)
+            #for 50x50x4 to 100x100x8
+            # bev_feat = self.upsample3d(bev_feat)
 
             bev_feat = [bev_feat] # bs, C, D, W, H
 
@@ -669,8 +685,8 @@ class FBOCC(CenterPoint):
             # print(f"\nHead time:{time.time()-t}")
 
             pred_occupancy = pred_occupancy.permute(0, 2, 3, 4, 1)[0]
-            if self.fix_void:
-                pred_occupancy = pred_occupancy[..., 1:]     
+            # if self.fix_void:
+            #     pred_occupancy = pred_occupancy[..., 1:]     
             pred_occupancy = pred_occupancy.softmax(-1)
 
 
@@ -683,7 +699,8 @@ class FBOCC(CenterPoint):
             if return_raw_occ:
                 pred_occupancy_category = pred_occupancy
             else:
-                pred_occupancy_category = pred_occupancy.argmax(-1) 
+                pred_occupancy_category = pred_occupancy.argmax(-1)
+                pred_occupancy_category = pred_occupancy[..., 1:]
             t=time.time()
 
             # # do not change the order
