@@ -190,7 +190,9 @@ class LoadOccupancy(object):
         # visible_mask_lidar = data['mask_lidar']
 
         if self.ignore_nonvisible:
-            occupancy[~visible_mask.to(torch.bool)] = 255
+            # occupancy[~visible_mask.to(torch.bool)] = 255
+            # Need to make 255 with below condition because of instance occlusion
+            occupancy[(visible_mask==0) & (occupancy==17)] = 255
 
 
         # to BEVDet format
