@@ -458,7 +458,7 @@ class FBOCC(CenterPoint):
             inst_ref_pts = self.inst_ref_pts.weight
             inst_ref_pts = inst_ref_pts.unsqueeze(0).repeat(bs, 1, 1)
 
-            inst_queries, voxel_ref_3d = self.deform_cross_attn(
+            inst_queries = self.deform_cross_attn(
                 inst_queries,
                 context_depthnet,
                 #query_pos = inst_pos,

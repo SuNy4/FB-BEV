@@ -9,6 +9,7 @@ from mmdet.models import NECKS
 from mmcv.ops import MultiScaleDeformableAttention
 from mmcv.runner import force_fp32, auto_fp16
 from .deform_squeeze import DeformableSqueezeAttention
+import math
 
 @NECKS.register_module()
 class TransformerLayer(nn.Module):
@@ -78,7 +79,7 @@ class DeformableTransformerLayer(nn.Module):
             embed_dims, num_heads, num_levels, num_points, batch_first=True, im2col_step=256)
         if mlp_ratio == 0:
             return
-        self.original_dim=data_config['src_size']
+        self.original_dim=data_config['input_size']
         self.norm2 = norm_layer(embed_dims)
         self.ffn = nn.Sequential(
             nn.Linear(embed_dims, embed_dims * mlp_ratio),
@@ -139,9 +140,12 @@ class DeformableTransformerLayer(nn.Module):
 
         if dim == '3d':
 
-            coords[..., 0] = (coords[..., 0] + self.x_bound[0]) / self.x_bound[-1]
-            coords[..., 1] = (coords[..., 0] + self.y_bound[0]) / self.y_bound[-1]
-            coords[..., 2] = (coords[..., 0] + self.z_bound[0]) / self.z_bound[-1]
+            X = torch.arange(*self.x_bound, dtype=torch.float) + self.x_bound[-1]/2
+            Y = torch.arange(*self.y_bound, dtype=torch.float) + self.y_bound[-1]/2
+            Z = torch.arange(*self.z_bound, dtype=torch.float) + self.z_bound[-1]/2
+            Y, X, Z = torch.meshgrid([Y, X, Z])
+            coords = torch.stack([X, Y, Z], dim=-1)
+            coords = coords.to(dtype).to(device)
 
             return coords
     

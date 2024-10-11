@@ -276,9 +276,10 @@ def main():
 
         for param in model.img_neck.parameters():
             param.requires_grad = False
-
-        for param in model.depth_net.parameters():
-            param.requires_grad = False
+            
+        if model.depth_net is not None:
+            for param in model.depth_net.parameters():
+                param.requires_grad = False
 
     if 'load_img_from' in cfg:
         logger.info(cfg.load_img_from)

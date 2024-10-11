@@ -6,6 +6,7 @@ from mmdet.models import NECKS
 
 import torch
 import torch.nn as nn
+import spconv
 
 class AggregationBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -180,4 +181,24 @@ class OcclusionMask(nn.Module):
         mask = mask <= 0.7
         mask = torch.any(mask, dim=-1)
 
-        return mask 
+        return mask  
+    
+@NECKS.register_module()
+class SparseCHconv(nn.Module):
+    def __init__(self, in_channel=None, out_channel = None):
+        super(SparseCHconv, self).__init__()
+        self.spconv2d = spconv.SparseConv2d(in_channels=in_channel, out_channels=out_channel, kernel_size=3, stride=1, padding=1)
+
+    def forward(self, input_tensor=None):
+        # input: bs, C*H, D, W
+        bs, _, D, W = input_tensor
+        coords = torch.nonzero(input_tensor, as_tuple=False) # (N, 4)
+        sparse_input = input_tensor[coords[:, 0], coords[:, 1], coords[:, 2], coords[:, 3]]
+        sparse_input = spconv.SparseConvTensor(
+            sparse_input,
+            coords = coords[:, [0, 2, 3]],
+            spatial_shape = (D, W),
+            batch_size = bs
+        )
+        output = self.spconv2d(sparse_input)
+        output = output.dense()
