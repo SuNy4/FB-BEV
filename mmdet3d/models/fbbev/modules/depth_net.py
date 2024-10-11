@@ -337,18 +337,18 @@ class CM_DepthNet(BaseModule):
 
         # if not  x.requires_grad: 
         x = x.to(torch.float32) # FIX distill type error
-        mlp_input = self.bn(mlp_input.reshape(-1, mlp_input.shape[-1]))
+        mlp_input = self.bn(mlp_input.reshape(-1, mlp_input.shape[-1])) # B*N, 27
         B, N, C, H, W = x.shape
         x = x.view(B * N, C, H, W)
         if self.with_cp and x.requires_grad:
             x = cp.checkpoint(self.reduce_conv, x)
         else:
             x = self.reduce_conv(x)
-        context_se = self.context_mlp(mlp_input)[..., None, None]
+        context_se = self.context_mlp(mlp_input)[..., None, None] # B*N, 512, 1, 1 // x = B*N, 512, H, W
         if self.with_cp and x.requires_grad:
             context = cp.checkpoint(self.context_se, x, context_se)
         else:
-            context = self.context_se(x, context_se)
+            context = self.context_se(x, context_se) # B*N, 512, H, W
         context = self.context_conv(context)
         depth_se = self.depth_mlp(mlp_input)[..., None, None]
         depth = self.depth_se(x, depth_se)
@@ -388,8 +388,9 @@ class CM_DepthNet(BaseModule):
         ],
                                 dim=-1)
         sensor2ego = torch.cat([rot, tran.reshape(B, N, 3, 1)],
-                               dim=-1).reshape(B, N, -1)
-        mlp_input = torch.cat([mlp_input, sensor2ego], dim=-1)
+                               dim=-1).reshape(B, N, -1)    # B, N, 3, 4 -> B, N, 12
+        mlp_input = torch.cat([mlp_input, sensor2ego], dim=-1) # B, N, 27
+        print(mlp_input.shape)
         return mlp_input
 
 

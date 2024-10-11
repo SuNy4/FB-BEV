@@ -14,7 +14,7 @@ from mmdet.models import HEADS
 from mmcv.cnn import build_conv_layer, build_norm_layer, build_upsample_layer
 from mmdet3d.models.fbbev.modules.occ_loss_utils import lovasz_softmax, CustomFocalLoss
 from mmdet3d.models.fbbev.modules.occ_loss_utils import nusc_class_frequencies, nusc_class_names
-from mmdet3d.models.fbbev.modules.occ_loss_utils import geo_scal_loss, sem_scal_loss, CE_ssc_loss, BCE_ssc_loss
+from mmdet3d.models.fbbev.modules.occ_loss_utils import geo_scal_loss, sem_scal_loss, CE_ssc_loss, BCE_ssc_loss, cos_sim_loss
 from torch.utils.checkpoint import checkpoint as cp
 from mmcv.runner import BaseModule, force_fp32
 from torch.cuda.amp import autocast
@@ -46,6 +46,18 @@ class OccHead(BaseModule):
         super(OccHead, self).__init__()
 
         self.fp16_enabled=False
+        
+        self.mlphead = nn.Sequential(
+            nn.Conv1d(in_channels, 128, kernel_size=1),
+            nn.BatchNorm1d(128),
+            nn.GELU(),
+            nn.Conv1d(128, 64, kernel_size=1),
+            nn.BatchNorm1d(64),
+            nn.GELU(),
+            nn.Conv1d(64, out_channel, kernel_size=1),
+            nn.BatchNorm1d(out_channel),
+            nn.GELU(),
+        )
       
         if type(in_channels) is not list:
             in_channels = [in_channels]
@@ -71,6 +83,7 @@ class OccHead(BaseModule):
             self.loss_weight_cfg = loss_weight_cfg
         
         # voxel losses
+        self.loss_cos_sim_weight = self.loss_weight_cfg.get('loss_cos_sim_weight', 1.0)
         self.loss_voxel_ce_weight = self.loss_weight_cfg.get('loss_voxel_ce_weight', 1.0)
         self.loss_voxel_sem_scal_weight = self.loss_weight_cfg.get('loss_voxel_sem_scal_weight', 1.0)
         self.loss_voxel_geo_scal_weight = self.loss_weight_cfg.get('loss_voxel_geo_scal_weight', 1.0)
@@ -78,37 +91,37 @@ class OccHead(BaseModule):
         
 
 
-        # voxel-level prediction
-        self.occ_convs = nn.ModuleList()
-        for i in range(self.num_level):
-            mid_channel = self.in_channels[i] // 2
-            occ_conv = nn.Sequential(
-                build_conv_layer(conv_cfg, in_channels=self.in_channels[i], 
-                        out_channels=mid_channel, kernel_size=3, stride=1, padding=1),
-                build_norm_layer(norm_cfg, mid_channel)[1],
-                nn.ReLU(inplace=True))
-            self.occ_convs.append(occ_conv)
+        # # voxel-level prediction
+        # self.occ_convs = nn.ModuleList()
+        # for i in range(self.num_level):
+        #     mid_channel = self.in_channels[i] // 2
+        #     occ_conv = nn.Sequential(
+        #         build_conv_layer(conv_cfg, in_channels=self.in_channels[i], 
+        #                 out_channels=mid_channel, kernel_size=3, stride=1, padding=1),
+        #         build_norm_layer(norm_cfg, mid_channel)[1],
+        #         nn.ReLU(inplace=True))
+        #     self.occ_convs.append(occ_conv)
 
 
-        self.occ_pred_conv = nn.Sequential(
-                build_conv_layer(conv_cfg, in_channels=mid_channel, 
-                        out_channels=mid_channel//2, kernel_size=1, stride=1, padding=0),
-                build_norm_layer(norm_cfg, mid_channel//2)[1],
-                nn.ReLU(inplace=True),
-                build_conv_layer(conv_cfg, in_channels=mid_channel//2, 
-                        out_channels=out_channel, kernel_size=1, stride=1, padding=0))
+        # self.occ_pred_conv = nn.Sequential(
+        #         build_conv_layer(conv_cfg, in_channels=mid_channel, 
+        #                 out_channels=mid_channel//2, kernel_size=1, stride=1, padding=0),
+        #         build_norm_layer(norm_cfg, mid_channel//2)[1],
+        #         nn.ReLU(inplace=True),
+        #         build_conv_layer(conv_cfg, in_channels=mid_channel//2, 
+        #                 out_channels=out_channel, kernel_size=1, stride=1, padding=0))
 
         self.soft_weights = soft_weights
         self.num_point_sampling_feat = self.num_level + 1 * self.use_deblock
-        if self.soft_weights:
-            soft_in_channel = mid_channel
-            self.voxel_soft_weights = nn.Sequential(
-                build_conv_layer(conv_cfg, in_channels=soft_in_channel, 
-                        out_channels=soft_in_channel//2, kernel_size=1, stride=1, padding=0),
-                build_norm_layer(norm_cfg, soft_in_channel//2)[1],
-                nn.ReLU(inplace=True),
-                build_conv_layer(conv_cfg, in_channels=soft_in_channel//2, 
-                        out_channels=self.num_point_sampling_feat, kernel_size=1, stride=1, padding=0))
+        # if self.soft_weights:
+        #     soft_in_channel = mid_channel
+        #     self.voxel_soft_weights = nn.Sequential(
+        #         build_conv_layer(conv_cfg, in_channels=soft_in_channel, 
+        #                 out_channels=soft_in_channel//2, kernel_size=1, stride=1, padding=0),
+        #         build_norm_layer(norm_cfg, soft_in_channel//2)[1],
+        #         nn.ReLU(inplace=True),
+        #         build_conv_layer(conv_cfg, in_channels=soft_in_channel//2, 
+        #                 out_channels=self.num_point_sampling_feat, kernel_size=1, stride=1, padding=0))
             
         # loss functions
         self.use_dice_loss = use_dice_loss
@@ -141,7 +154,8 @@ class OccHead(BaseModule):
                                     nn.ReLU(inplace=True))
 
 
-        self.class_names = nusc_class_names    
+        self.class_names = nusc_class_names
+
         self.empty_idx = empty_idx
     
     @force_fp32(apply_to=('voxel_feats')) 
@@ -202,8 +216,31 @@ class OccHead(BaseModule):
         return res
     
     @force_fp32()
-    def forward_train(self, voxel_feats, img_feats=None, pts_feats=None, transform=None, gt_occupancy=None, gt_occupancy_flow=None, **kwargs):
-        res = self.forward(voxel_feats, img_feats=img_feats, pts_feats=pts_feats, transform=transform, **kwargs)
+    def forward_sparse(self, voxel_feats, img_feats=None, pts_feats=None, transform=None, **kwargs):
+            
+        assert type(voxel_feats) is list and len(voxel_feats) == self.num_level
+
+        voxel_feats = voxel_feats[0]
+        bs, C, D, W, H = voxel_feats.shape
+        voxel_feats = voxel_feats.flatten(2) # bs C DWH
+
+        voxel_feats = self.mlphead(voxel_feats)
+        voxel_feats = voxel_feats.reshape(bs, -1, D, W, H)
+
+        res = {
+            'output_voxels': [voxel_feats],
+            'output_voxels_fine': None,
+            'output_coords_fine': None,
+        }
+
+        return res
+
+    @force_fp32()
+    def forward_train(self, voxel_feats, img_feats=None, pts_feats=None, transform=None, gt_occupancy=None, gt_occupancy_flow=None, sparse=False, **kwargs):
+        if sparse:
+            res = self.forward_sparse(voxel_feats)
+        else:
+            res = self.forward(voxel_feats, img_feats=img_feats, pts_feats=pts_feats, transform=transform, **kwargs)
         loss = self.loss(target_voxels=gt_occupancy,
             output_voxels = res['output_voxels'],
             output_coords_fine=res['output_coords_fine'],
@@ -240,18 +277,19 @@ class OccHead(BaseModule):
 
         # igore 255 = ignore noise. we keep the loss bascward for the label=0 (free voxels)
 
-        if self.use_focal_loss:
-            loss_dict['loss_voxel_ce_{}'.format(tag)] = self.loss_voxel_ce_weight * self.focal_loss(output_voxels, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=0) # ignore Occluded
-        else:
-            loss_dict['loss_voxel_ce_{}'.format(tag)] = self.loss_voxel_ce_weight * CE_ssc_loss(output_voxels, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=255)
-
+        # if self.use_focal_loss:
+        #     loss_dict['loss_voxel_ce_{}'.format(tag)] = self.loss_voxel_ce_weight * self.focal_loss(output_voxels, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=0) # ignore Occluded
+        # else:
+        #     loss_dict['loss_voxel_ce_{}'.format(tag)] = self.loss_voxel_ce_weight * CE_ssc_loss(output_voxels, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=255)
+        loss_dict['loss_gemetry_sim_{}'.format(tag)] = self.loss_cos_sim_weight * cos_sim_loss(kwargs['results']['overlap_feat_per_batch']) + \
+                                                        self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['geom'], target_voxels, ignore_index=255, non_empty_idx=self.empty_idx, coarse=True)
         loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = self.loss_voxel_sem_scal_weight * sem_scal_loss(output_voxels, target_voxels, ignore_index=0) # Check only 1~17 classes
-        loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = (self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=0, non_empty_idx=self.empty_idx) + 
-                                                           self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=0)) / 2 # Check Free area
+        loss_dict['loss_voxel_geo_coarse_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=self.empty_idx, coarse=False)
+         # Check Free area
         #####
         # Check Occluded Area
         # loss_dict['loss_voxel_unknown_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=0)
-        loss_dict['loss_voxel_unknown_ce_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * BCE_ssc_loss(kwargs['results']['unknown'], target_voxels)                                               
+        # loss_dict['loss_voxel_unknown_ce_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * BCE_ssc_loss(kwargs['results']['unknown'], target_voxels)                                               
         #####
         loss_dict['loss_voxel_lovasz_{}'.format(tag)] = self.loss_voxel_lovasz_weight * lovasz_softmax(torch.softmax(output_voxels, dim=1), target_voxels, ignore=0) 
 
