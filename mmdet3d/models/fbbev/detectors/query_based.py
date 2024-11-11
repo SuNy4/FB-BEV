@@ -1,0 +1,975 @@
+# Copyright (c) 2022-2023, NVIDIA Corporation & Affiliates. All rights reserved. 
+# 
+# This work is made available under the Nvidia Source Code License-NC. 
+# To view a copy of this license, visit 
+# https://github.com/NVlabs/FB-BEV/blob/main/LICENSE
+
+import torch
+import torch.nn.functional as F
+import torch.nn as nn
+from mmcv.runner import force_fp32
+import os
+from mmdet3d.ops.bev_pool_v2.bev_pool import TRTBEVPoolv2
+from mmdet.models import DETECTORS
+from mmdet3d.models import builder
+from mmdet3d.models.detectors import CenterPoint
+from mmdet3d.models.builder import build_head, build_neck
+import numpy as np
+import copy 
+import spconv.pytorch as spconv
+from tqdm import tqdm 
+from mmdet3d.models.fbbev.utils import run_time
+import torch
+from torchvision.utils import make_grid
+import torchvision
+import matplotlib.pyplot as plt
+import cv2
+from collections import defaultdict
+from mmcv.runner import get_dist_info
+from mmdet.core import reduce_mean
+import mmcv
+from mmdet3d.datasets.utils import nuscenes_get_rt_matrix
+from mmdet3d.core.bbox import box_np_ops # , corner_to_surfaces_3d, points_in_convex_polygon_3d_jit
+import time
+from sklearn.cluster import KMeans
+
+
+def generate_forward_transformation_matrix(bda, img_meta_dict=None):
+    b = bda.size(0)
+    hom_res = torch.eye(4)[None].repeat(b, 1, 1).to(bda.device)
+    for i in range(b):
+        hom_res[i, :3, :3] = bda[i]
+    return hom_res
+
+
+@DETECTORS.register_module()
+class FBOCC(CenterPoint):
+
+    def __init__(self, 
+                 # BEVDet components
+                 forward_projection=None,
+                 img_bev_encoder_backbone=None,
+                 img_bev_encoder_neck=None,
+
+                 # Fast Instance Occ
+                 cam_pos_encoder = None,
+                 cam_feat_encoder = None,
+                 back_project=None,
+                 voxel_self_attn=None,
+                 geometry_head=None,
+                 inst_lvl_self_attn=None,
+
+                 attn_level=None,
+                 grid_config=None,
+                 bev_fcn_encoder=None,
+                 img_query_cross_attn=None,
+
+                 occ_self_attn=None,
+                 keypoint=None,
+
+                 # BEVFormer components
+                 backward_projection=None,
+
+                 # FB-BEV components
+                 frpn=None,
+
+                 # depth_net
+                 depth_net=None,
+
+                 # occupancy head
+                 occupancy_head=None,
+
+                 # other settings.
+                 embed_dim=None,
+                 use_depth_supervision=False,
+                 readd=False,
+                 fix_void=False,
+                 occupancy_save_path=None,
+                 do_history=False,
+                 interpolation_mode='bilinear',
+                 history_cat_num=16,
+                 history_cat_conv_out_channels=None,
+                 single_bev_num_channels=80,
+
+                  **kwargs):
+        super(FBOCC, self).__init__(**kwargs)
+        self.fix_void = fix_void
+        self.num_levels = attn_level
+        self.grid_config = grid_config
+        self.occ_mesh = grid_config['x']
+      
+        # BEVDet init
+        self.forward_projection = builder.build_neck(forward_projection) if forward_projection else None
+        self.img_bev_encoder_backbone = builder.build_backbone(img_bev_encoder_backbone) if img_bev_encoder_backbone else None
+        self.img_bev_encoder_neck = builder.build_neck(img_bev_encoder_neck) if img_bev_encoder_neck else None
+        self.img_query_cross_attn = builder.build_neck(img_query_cross_attn) if img_query_cross_attn else None
+
+        #FIOcc init
+        #self.object_embedd = nn.Embedding()
+        self.cam_pos_encoder = builder.build_neck(cam_pos_encoder) if cam_pos_encoder else None
+        self.cam_feat_encoder = builder.build_neck(cam_feat_encoder) if cam_feat_encoder else None
+        self.back_project = builder.build_neck(back_project) if back_project else None
+        self.bev_fcn_encoder = builder.build_neck(bev_fcn_encoder) if bev_fcn_encoder else None
+        self.voxel_self_attn = builder.build_neck(voxel_self_attn) if voxel_self_attn else None
+        self.geometry_head = builder.build_neck(geometry_head) if geometry_head else None
+        self.inst_lvl_self_attn = builder.build_neck(inst_lvl_self_attn) if back_project else None
+        self.main_queries = nn.Embedding(50, 256)
+
+        # FC layer
+
+
+        # BEVFormer init
+        self.backward_projection = builder.build_head(backward_projection) if backward_projection else None
+    
+        # FB-BEV init
+        if not self.forward_projection: assert not frpn, 'frpn relies on LSS'
+        self.frpn = builder.build_head(frpn) if frpn else None
+
+        # Depth Net
+        self.depth_net = builder.build_head(depth_net) if depth_net else None
+
+        # Occupancy Head
+        self.occupancy_head = builder.build_head(occupancy_head) if occupancy_head else None
+
+
+        self.readd = readd # fuse voxel features and bev features
+        
+        self.use_depth_supervision = use_depth_supervision
+        
+        self.occupancy_save_path = occupancy_save_path # for saving data\for submitting to test server
+
+        # # Deal with history
+        # self.single_bev_num_channels = single_bev_num_channels
+        # self.do_history = do_history
+        # self.interpolation_mode = interpolation_mode
+        # self.history_cat_num = history_cat_num
+        # self.history_cam_sweep_freq = 0.5 # seconds between each frame
+        # history_cat_conv_out_channels = (history_cat_conv_out_channels 
+        #                                  if history_cat_conv_out_channels is not None 
+        #                                  else self.single_bev_num_channels)
+        # ## Embed each sample with its relative temporal offset with current timestep
+        # conv = nn.Conv2d if self.forward_projection.nx[-1] == 1 else nn.Conv3d
+        # self.history_keyframe_time_conv = nn.Sequential(
+        #      conv(self.single_bev_num_channels + 1,
+        #              self.single_bev_num_channels,
+        #              kernel_size=1,
+        #              padding=0,
+        #              stride=1),
+        #      nn.SyncBatchNorm(self.single_bev_num_channels),
+        #      nn.ReLU(inplace=True))
+        # ## Then concatenate and send them through an MLP.
+        # self.history_keyframe_cat_conv = nn.Sequential(
+        #     conv(self.single_bev_num_channels * (self.history_cat_num + 1),
+        #             history_cat_conv_out_channels,
+        #             kernel_size=1,
+        #             padding=0,
+        #             stride=1),
+        #     nn.SyncBatchNorm(history_cat_conv_out_channels),
+        #     nn.ReLU(inplace=True))
+        # self.history_sweep_time = None
+        self.history_bev = None
+        # self.history_bev_before_encoder = None
+        # self.history_seq_ids = None
+        # self.history_forward_augs = None
+        # self.count = 0
+
+    def with_specific_component(self, component_name):
+        """Whether the model owns a specific component"""
+        return getattr(self, component_name, None) is not None
+    
+    def image_encoder(self, img):
+        imgs = img
+        B, N, C, imH, imW = imgs.shape
+        imgs = imgs.view(B * N, C, imH, imW)
+      
+        x = self.img_backbone(imgs)
+       
+        if self.with_img_neck:
+            x = self.img_neck(x)
+            if type(x) in [list, tuple]:
+                x = x[0]
+        _, output_dim, ouput_H, output_W = x.shape
+        x = x.view(B, N, output_dim, ouput_H, output_W)
+      
+        return x
+
+    @force_fp32()
+    def bev_encoder(self, x):
+        if self.with_specific_component('img_bev_encoder_backbone'):
+            x = self.img_bev_encoder_backbone(x)
+        
+        if self.with_specific_component('img_bev_encoder_neck'):
+            x = self.img_bev_encoder_neck(x)
+        
+        if type(x) not in [list, tuple]:
+             x = [x]
+
+        return x
+
+    @force_fp32()
+    def fuse_history(self, curr_bev, img_metas, bda): # align features with 3d shift
+
+        voxel_feat = True  if len(curr_bev.shape) == 5 else False
+        if voxel_feat:
+            curr_bev = curr_bev.permute(0, 1, 4, 2, 3) # n, c, z, h, w
+        
+        seq_ids = torch.LongTensor([
+            single_img_metas['sequence_group_idx'] 
+            for single_img_metas in img_metas]).to(curr_bev.device)
+        start_of_sequence = torch.BoolTensor([
+            single_img_metas['start_of_sequence'] 
+            for single_img_metas in img_metas]).to(curr_bev.device)
+        forward_augs = generate_forward_transformation_matrix(bda)
+
+        curr_to_prev_ego_rt = torch.stack([
+            single_img_metas['curr_to_prev_ego_rt']
+            for single_img_metas in img_metas]).to(curr_bev)
+
+        ## Deal with first batch
+        if self.history_bev is None:
+            self.history_bev = curr_bev.clone()
+            self.history_seq_ids = seq_ids.clone()
+            self.history_forward_augs = forward_augs.clone()
+
+            # Repeat the first frame feature to be history
+            if voxel_feat:
+                self.history_bev = curr_bev.repeat(1, self.history_cat_num, 1, 1, 1) 
+            else:
+                self.history_bev = curr_bev.repeat(1, self.history_cat_num, 1, 1)
+            # All 0s, representing current timestep.
+            self.history_sweep_time = curr_bev.new_zeros(curr_bev.shape[0], self.history_cat_num)
+
+
+        self.history_bev = self.history_bev.detach()
+
+        assert self.history_bev.dtype == torch.float32
+
+        ## Deal with the new sequences
+        # First, sanity check. For every non-start of sequence, history id and seq id should be same.
+
+        assert (self.history_seq_ids != seq_ids)[~start_of_sequence].sum() == 0, \
+                "{}, {}, {}".format(self.history_seq_ids, seq_ids, start_of_sequence)
+
+        ## Replace all the new sequences' positions in history with the curr_bev information
+        self.history_sweep_time += 1 # new timestep, everything in history gets pushed back one.
+        if start_of_sequence.sum()>0:
+            if voxel_feat:    
+                self.history_bev[start_of_sequence] = curr_bev[start_of_sequence].repeat(1, self.history_cat_num, 1, 1, 1)
+            else:
+                self.history_bev[start_of_sequence] = curr_bev[start_of_sequence].repeat(1, self.history_cat_num, 1, 1)
+            
+            self.history_sweep_time[start_of_sequence] = 0 # zero the new sequence timestep starts
+            self.history_seq_ids[start_of_sequence] = seq_ids[start_of_sequence]
+            self.history_forward_augs[start_of_sequence] = forward_augs[start_of_sequence]
+
+
+        ## Get grid idxs & grid2bev first.
+        if voxel_feat:
+            n, c_, z, h, w = curr_bev.shape
+
+        # Generate grid
+        xs = torch.linspace(0, w - 1, w, dtype=curr_bev.dtype, device=curr_bev.device).view(1, w, 1).expand(h, w, z)
+        ys = torch.linspace(0, h - 1, h, dtype=curr_bev.dtype, device=curr_bev.device).view(h, 1, 1).expand(h, w, z)
+        zs = torch.linspace(0, z - 1, z, dtype=curr_bev.dtype, device=curr_bev.device).view(1, 1, z).expand(h, w, z)
+        grid = torch.stack(
+            (xs, ys, zs, torch.ones_like(xs)), -1).view(1, h, w, z, 4).expand(n, h, w, z, 4).view(n, h, w, z, 4, 1)
+
+        # This converts BEV indices to meters
+        # IMPORTANT: the feat2bev[0, 3] is changed from feat2bev[0, 2] because previous was 2D rotation
+        # which has 2-th index as the hom index. Now, with 3D hom, 3-th is hom
+        feat2bev = torch.zeros((4,4),dtype=grid.dtype).to(grid)
+        feat2bev[0, 0] = self.forward_projection.dx[0]
+        feat2bev[1, 1] = self.forward_projection.dx[1]
+        feat2bev[2, 2] = self.forward_projection.dx[2]
+        feat2bev[0, 3] = self.forward_projection.bx[0] - self.forward_projection.dx[0] / 2.
+        feat2bev[1, 3] = self.forward_projection.bx[1] - self.forward_projection.dx[1] / 2.
+        feat2bev[2, 3] = self.forward_projection.bx[2] - self.forward_projection.dx[2] / 2.
+        # feat2bev[2, 2] = 1
+        feat2bev[3, 3] = 1
+        feat2bev = feat2bev.view(1,4,4)
+
+        ## Get flow for grid sampling.
+        # The flow is as follows. Starting from grid locations in curr bev, transform to BEV XY11,
+        # backward of current augmentations, curr lidar to prev lidar, forward of previous augmentations,
+        # transform to previous grid locations.
+        rt_flow = (torch.inverse(feat2bev) @ self.history_forward_augs @ curr_to_prev_ego_rt
+                   @ torch.inverse(forward_augs) @ feat2bev)
+
+        grid = rt_flow.view(n, 1, 1, 1, 4, 4) @ grid
+
+        # normalize and sample
+        normalize_factor = torch.tensor([w - 1.0, h - 1.0, z - 1.0], dtype=curr_bev.dtype, device=curr_bev.device)
+        grid = grid[:,:,:,:, :3,0] / normalize_factor.view(1, 1, 1, 1, 3) * 2.0 - 1.0
+        
+
+        tmp_bev = self.history_bev
+        if voxel_feat: 
+            n, mc, z, h, w = tmp_bev.shape
+            tmp_bev = tmp_bev.reshape(n, mc, z, h, w)
+        sampled_history_bev = F.grid_sample(tmp_bev, grid.to(curr_bev.dtype).permute(0, 3, 1, 2, 4), align_corners=True, mode=self.interpolation_mode)
+
+        ## Update history
+        # Add in current frame to features & timestep
+        self.history_sweep_time = torch.cat(
+            [self.history_sweep_time.new_zeros(self.history_sweep_time.shape[0], 1), self.history_sweep_time],
+            dim=1) # B x (1 + T)
+
+        if voxel_feat:
+            sampled_history_bev = sampled_history_bev.reshape(n, mc, z, h, w)
+            curr_bev = curr_bev.reshape(n, c_, z, h, w)
+        feats_cat = torch.cat([curr_bev, sampled_history_bev], dim=1) # B x (1 + T) * 80 x H x W or B x (1 + T) * 80 xZ x H x W 
+
+        # Reshape and concatenate features and timestep
+        feats_to_return = feats_cat.reshape(
+                feats_cat.shape[0], self.history_cat_num + 1, self.single_bev_num_channels, *feats_cat.shape[2:]) # B x (1 + T) x 80 x H x W
+        if voxel_feat:
+            feats_to_return = torch.cat(
+            [feats_to_return, self.history_sweep_time[:, :, None, None, None, None].repeat(
+                1, 1, 1, *feats_to_return.shape[3:]) * self.history_cam_sweep_freq
+            ], dim=2) # B x (1 + T) x 81 x Z x H x W
+        else:
+            feats_to_return = torch.cat(
+            [feats_to_return, self.history_sweep_time[:, :, None, None, None].repeat(
+                1, 1, 1, feats_to_return.shape[3], feats_to_return.shape[4]) * self.history_cam_sweep_freq
+            ], dim=2) # B x (1 + T) x 81 x H x W
+
+        # Time conv
+        feats_to_return = self.history_keyframe_time_conv(
+            feats_to_return.reshape(-1, *feats_to_return.shape[2:])).reshape(
+                feats_to_return.shape[0], feats_to_return.shape[1], -1, *feats_to_return.shape[3:]) # B x (1 + T) x 80 xZ x H x W
+
+        # Cat keyframes & conv
+        feats_to_return = self.history_keyframe_cat_conv(
+            feats_to_return.reshape(
+                feats_to_return.shape[0], -1, *feats_to_return.shape[3:])) # B x C x H x W or B x C x Z x H x W
+        
+        self.history_bev = feats_cat[:, :-self.single_bev_num_channels, ...].detach().clone()
+        self.history_sweep_time = self.history_sweep_time[:, :-1]
+        self.history_forward_augs = forward_augs.clone()
+        if voxel_feat:
+            feats_to_return = feats_to_return.permute(0, 1, 3, 4, 2)
+        if not self.do_history:
+            self.history_bev = None
+        return feats_to_return.clone()
+
+#######################################################################################################
+    ### OVerall Flow: 2D feature encode with global pos info -> 2D 3D deformable attention(Sim Loss) -> 3D deformable self attention -> Occupied MLP head(CE loss) -> Sparsified voxels(large norm self attention) -> MLP head -> Combine Map
+    
+    ### TODO: Global pos encode to img feature
+    ### TODO_append: Sparse Conv3d => instance level self attention으로 일단 대체(Temporal을 위해서 넘길만한 무언가를 빼줘야됨)
+    ### TODO: Combine in Head and Overlap area loss
+    def extract_img_bev_feat(self, img, img_metas, **kwargs):
+        """Extract features of images."""
+
+        return_map = {}
+
+        context = self.image_encoder(img[0]) # Bs, Ncam, C, H, W
+
+        cam_params = img[1:7]
+        #rot, tran, intrin, post_rot, post_tran, bda = *cam_params
+        if self.with_specific_component('img_query_cross_attn'):
+            bs, Ncam, _, _, _ = context.shape
+
+            context = context.flatten(-2, -1)
+            context = context.flatten(0, 1)
+            global_queries = self.main_queries.parameters().unsqueeze(-1).repeat(bs*Ncam)
+            # img_pos_encode = 
+
+            inst_queries, attn_weights = self.img_query_cross_attn(
+                query = global_queries,
+                key = context,
+                value = context
+            )
+            # attn_weights: bs*Ncam, N_heads, N_queries, HW
+            # inst queries는 이제 특정 instnace의 임베딩에서 이미지에서의 그 특정 instance들이 어떻게 나타나는지에 대한 정보를 가지고 있을 것
+
+            attn_weights = torch.mean(attn_weights, dim=1) # bs*Ncam, N_queries, HW
+            _, max_indices = torch.max(attn_weights, dim=-1) # bs*Ncam, N_queries
+            img_h = max_indices // W # bs*Ncam, N_queries
+            img_w = max_indices % W # bs*Ncam, N_queries
+            max_img_coords = torch.cat(img_h.unsqueeze(-1), img_w.unsqueeze(-1), dim = -1) # bs, Ncam, N_queries, 2
+
+        if self.with_specific_component('query_self_attn'):
+            inst_queries = self.self_attn(
+                query = inst_queries
+            )
+            # 이미지에서 나타나는 instance들이 어떠한 관계를 가지는가: 목표로 하는건 위치관계를 학습하는 것
+
+        # #### TODO: context: bs, Ncam, C, H, W // cam_pos_encode: bs, Ncam, C', H, W // Query: bs, Ncam, C', Max_len  차원을 줄인 Camera pos encode를 통해서 pos 정보만 있는 query와의 Q K 연산, 이후 V를 context로 넣어주기. key를 따로 인코딩하자
+        # if self.with_specific_component('back_project'):
+            
+        #     bs, Ncam, embed_dim, h, w = context.shape #bs, Ncam, 256, 16, 44
+        #     # context_pos_encode = 
+        #     # global_pos = Bs, N, C
+
+        #     spatial_shapes = []
+            
+        #     spatial_shape = (h, w)
+        #     spatial_shapes.append(spatial_shape)
+
+        #     spatial_shapes = torch.as_tensor(
+        #         spatial_shapes, dtype=torch.long, device=context.device)
+        #     level_start_index = torch.cat((spatial_shapes.new_zeros(
+        #         (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+            
+        #     # occ_feat_per_cam: bs, Ncam, Max_Len, C
+        #     # indexes: [bs][ncam][N][3] List
+        #     # overlapped: [bs][전체 overlapped 수][3]
+        #     # global_pos_per_cam: bs, Ncam, Max_Len, C'
+        #     # occ_feat = bs, Ncam, D, W, H, C (Zeros)
+        #     # Global Pos Encode: D, W, H, 4 cartisian
+
+        #     occ_feat_per_cam, indexes, global_pos_encode = self.back_project(
+        #         value = context,
+        #         view_transform = True,
+        #         spatial_shapes = spatial_shapes,
+        #         level_start_index = level_start_index,
+        #         cam_params = cam_params,
+        #         attn_level = self.num_levels,
+        #     )
+
+            C = occ_feat_per_cam.shape[-1]
+            D, W, H, _ = global_pos_encode.shape
+            global_pos_encode = global_pos_encode.unsqueeze(0).repeat(bs, 1, 1, 1, 1) # bs, D, W, H, C
+            
+            occ_feat_per_cam = occ_feat_per_cam.permute(1, 0, 2, 3) # Ncam, bs, Max_Len, C
+            occ_feat = torch.zeros(bs, D, W, H, C).cuda()
+
+            # occ_feat: Bs, D, W, H, C
+            overlap1 = []
+            overlap2 = []
+            for j in range(bs):
+                feat_1, feat_2 = None, None
+                for i, query_per_cam in enumerate(occ_feat_per_cam):
+                    index_query_per_img = indexes[j][i] #(N, 3)
+                    d_indices = index_query_per_img[:, 0]
+                    w_indices = index_query_per_img[:, 1]
+                    h_indices = index_query_per_img[:, 2]
+                    
+                    ####### overlap area check ############
+                    target = occ_feat[j, d_indices, w_indices, h_indices]
+                    object = query_per_cam[j, :len(index_query_per_img)]
+                    mask = target.ne(0).any(dim=-1)
+                    if mask.any():
+                        feat1 = target[mask]
+                        feat2 = object[mask]
+                        if feat_1 is not None and feat_2 is not None:
+                            feat1 = torch.cat([feat_1, feat1], dim=0)
+                            feat2 = torch.cat([feat_2, feat2], dim=0)
+                        feat_1 = feat1
+                        feat_2 = feat2
+                    ######################################
+
+                    occ_feat[j, d_indices, w_indices, h_indices] = query_per_cam[j, :len(index_query_per_img)]
+
+                overlap1.append(feat_1)
+                overlap2.append(feat_2)
+
+
+            # occ_feat = torch.sum(occ_feat, dim=1) # bs, D, W, H, C
+            # for j in range(bs):
+            #     overlap = overlapped[j]
+            #     occ_feat[j, overlap[:,0], overlap[:,1], overlap[:,2]] /= 2
+
+            # return_map['occ_feat'] = occ_feat #bs, D, W, H, C
+            return_map['overlapped_pair'] = [overlap1, overlap2] # (N of overlap, 128)
+            # return_map['occ_feat_per_cam'] = occ_feat_per_cam # Ncam, bs, N, embed_dim
+            # return_map['per_cam_index'] = indexes # [bs][Ncam][N][3]
+
+        # if self.with_specific_component('voxel_self_attn'):
+        #     occ_feat = occ_feat.flatten(1, 3) # bs, DWH, C
+        #     global_pos_encode = global_pos_encode.flatten(1, 3) # bs, DWH, C
+
+        #     x = torch.arange(D).view(-1, 1, 1).expand(D, W, H)
+        #     y = torch.arange(W).view(1, -1, 1).expand(D, W, H)
+        #     z = torch.arange(H).view(1, 1, -1).expand(D, W, H)
+        #     coords = torch.stack([x, y, z], dim=-1).flatten(0,2).unsqueeze(0).repeat(bs, 1, 1).cuda() # bs, DWH, 3
+            
+        #     spatial_shapes = []
+        #     spatial_shape = (D, W, H)
+        #     spatial_shapes.append(spatial_shape)
+
+        #     spatial_shapes = torch.as_tensor(
+        #         spatial_shapes, dtype=torch.long, device=context.device)
+        #     level_start_index = torch.cat((spatial_shapes.new_zeros(
+        #         (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+
+        #     occ_feat = self.voxel_self_attn(
+        #             query = occ_feat,
+        #             query_pos = global_pos_encode,
+        #             value = occ_feat,
+        #             ref_pts = coords,
+        #             occ_value = True,
+        #             spatial_shapes = spatial_shapes,
+        #             level_start_index = level_start_index,
+        #         )
+            
+        #     occ_feat = occ_feat.reshape(bs, D, W, H, C)
+        #     global_pos_encode = global_pos_encode.reshape(bs, D, W, H, C)
+
+        if self.with_specific_component('geometry_head'):
+            prob, _ = self.geometry_head(occ_feat) # bs, D, W, H: boolean tensor
+            return_map['pred_cam_mask'] = prob
+            ##############################################################
+            occ_feat *= prob.unsqueeze(-1)
+            # n=50
+
+            # occ_feat = occ_feat.flatten(1,3)
+            # global_pos_encode = global_pos_encode.flatten(1,3)
+            # selected_feats = []
+            # selected_pos = []
+
+            # for b in range(bs):
+            #     norms = torch.norm(occ_feat[b], dim=-1)
+            #     _, top_indices = torch.topk(norms, n)
+
+            #     voxel_feat = occ_feat[b, top_indices]
+            #     voxel_pos = global_pos_encode[b, top_indices]
+
+            #     selected_feats.append(voxel_feat)
+            #     selected_pos.append(voxel_pos)
+            
+            # selected_feats = torch.stack(selected_feats)  # (bs, 100, C)
+            # selected_pos = torch.stack(selected_pos)
+
+            # for _ in range(self.num_levels):
+            #     occ_feat = self.voxel_self_attn(
+            #         query = occ_feat,
+            #         query_pos = global_pos_encode,
+            #         key = selected_feats,
+            #         key_pos = selected_pos,
+            #         value = selected_feats,
+            #     )
+            
+            # occ_feat = occ_feat.reshape(bs, D, W, H, C)
+            # global_pos_encode = global_pos_encode.reshape(bs, D, W, H, C)
+            # prob, geom = self.geometry_head(occ_feat) # bs, D, W, H: boolean tensor
+            # return_map['geom'] = prob
+
+            # occ_index = [] # [bs][N][3] occupied voxel indexes
+            # max_len = 0
+                        
+            # for i, per_batch_geom in enumerate(geom):
+            #     index_per_batch = per_batch_geom.nonzero().squeeze(-1)
+            #     occ_index.append(index_per_batch)
+            #     max_len = max(max_len, len(index_per_batch))
+
+            # sparse_voxel = torch.zeros([
+            #     bs, max_len, embed_dim
+            # ]).cuda()
+
+            # sparse_pos_enc = torch.zeros([
+            #     bs, max_len, embed_dim
+            # ]).cuda()
+
+            # for i, index in enumerate(occ_index):   
+            #     d_indices = index[:, 0]
+            #     w_indices = index[:, 1]
+            #     h_indices = index[:, 2]
+            #     sparse_voxel[i, :len(index)] = occ_feat[i, d_indices, w_indices, h_indices]
+            #     sparse_pos_enc[i, :len(index)] = global_pos_encode[i, d_indices, w_indices, h_indices]
+            ########################################################################
+            # occ_index = [] # [bs][N][3] occupied voxel indexes
+            # max_len = 0
+            
+            # for i, per_batch_geom in enumerate(geom):
+            #     index_per_batch = per_batch_geom.nonzero().squeeze(-1)
+            #     occ_index.append(index_per_batch)
+            #     max_len = max(max_len, len(index_per_batch))
+
+            # sparse_voxel = torch.zeros([
+            #     bs, max_len, embed_dim
+            # ]).cuda()
+
+            # sparse_pos_enc = torch.zeros([
+            #     bs, max_len, embed_dim
+            # ]).cuda()
+
+            # for i, index in enumerate(occ_index):   
+            #     d_indices = index[:, 0]
+            #     w_indices = index[:, 1]
+            #     h_indices = index[:, 2]
+            #     sparse_voxel[i, :len(index)] = occ_feat[i, d_indices, w_indices, h_indices]
+            #     sparse_pos_enc[i, :len(index)] = global_pos_encode[i, d_indices, w_indices, h_indices]
+
+        if self.with_specific_component('bev_fcn_encoder'):
+            C_ = global_pos_encode.shape[-1]
+            occ_feat = torch.cat([occ_feat, global_pos_encode[..., (C_-32):]], dim=-1)  # bs, D, W, H, C+C'
+  
+            # occ_feat.shape = bs, D, W, H, C => bs, H*C, D, W => bs, c_out, D, W
+            occ_feat = occ_feat.flatten(3, 4).permute(0, 3, 1, 2) # bs, H*C, D, W
+            occ_feat, bev_h = self.bev_fcn_encoder(occ_feat) # bs, C', D, W // bs, D, W, H
+
+            return_map['geom'] = bev_h
+            
+            bev_h = (bev_h > 0.5)
+            occ_feat = occ_feat.unsqueeze(-1) * bev_h.unsqueeze(1)# bs, C, D, W, H
+            occ_feat = occ_feat.permute(0, 2, 3, 4, 1)
+
+            occ_index = [] # [bs][N][3] occupied voxel indexes
+            max_len = 0
+            
+            for i, per_batch_geom in enumerate(bev_h):
+                index_per_batch = per_batch_geom.nonzero().squeeze(-1)
+                occ_index.append(index_per_batch)
+                max_len = max(max_len, len(index_per_batch))
+
+            sparse_voxel = torch.zeros([
+                bs, max_len, embed_dim
+            ]).cuda()
+
+            sparse_pos_enc = torch.zeros([
+                bs, max_len, embed_dim
+            ]).cuda()
+
+            for i, index in enumerate(occ_index):   
+                d_indices = index[:, 0]
+                w_indices = index[:, 1]
+                h_indices = index[:, 2]
+                sparse_voxel[i, :len(index)] = occ_feat[i, d_indices, w_indices, h_indices]
+                sparse_pos_enc[i, :len(index)] = global_pos_encode[i, d_indices, w_indices, h_indices]
+
+        # if self.with_specific_component('sparse_conv_encoder'):
+        #     # occ_feat = bs, D, W, H, C => bs, D, W, H*C => bs, H*C, D, W
+        #     # SparseFCN: bs, c*H, D, W => bs, c, D, W = bs, c_out, D, W
+        #     bs, D, W, H, C = occ_feat.shape
+        #     occ_feat = occ_feat.flatten(3, 4).permute(0, 3, 1, 2) # bs, H*C, D, W
+
+        #     # TODO: use spconv for fcn encoding
+        #     occ_feat = self.bev_fcn_encoder(occ_feat)
+
+        #     occ_feat = self.gelu(self.bn1(self.conv1(occ_feat))) # bs, C, D, W
+        #     occ_h = self.gelu(self.bn2(self.conv2(occ_feat))).permute(0, 2, 3, 1) # bs, H, D, W => bs, D, W, H
+        #     # TODO: geometric supervision
+        #     occ_h = occ_h.unsqueeze(1).sigmoid()
+            
+        #     occ_feat = occ_feat.unsqueeze(-1) * occ_h # bs, C, D, W, H
+        #     return_map['unknown'] = self.upsample3d(occ_h)
+            
+        #     # For 50x50x4
+        #     # bev_feat = self.maxpool3d(bev_feat)
+        #     _, _, D, W, H = bev_feat.shape
+
+        if self.with_specific_component('inst_lvl_self_attn'):
+
+            bs, N, C = sparse_voxel.shape
+            selected_feats = []
+            selected_pos = []
+            n = 100
+
+            for b in range(bs):
+                norms = torch.norm(sparse_voxel[b], dim=-1)
+                _, top_indices = torch.topk(norms, n)
+
+                voxel_feat = sparse_voxel[b, top_indices]
+                voxel_pos = sparse_pos_enc[b, top_indices]
+
+                selected_feats.append(voxel_feat)
+                selected_pos.append(voxel_pos)
+
+            selected_feats = torch.stack(selected_feats)  # (bs, 100, C)
+            selected_pos = torch.stack(selected_pos)
+
+            ###################### Clusturing Method ##################
+            # n_clusters = 100
+            # for b in range(bs):
+            #     batch_feature = sparse_voxel[b].detach() # (N, C)
+            #     batch_pos = sparse_pos_enc[b]
+            #     kmeans = KMeans(n_clusters=n_clusters, random_state=0).fit(batch_feature.cpu().numpy())
+
+            #     cluster_labels = torch.tensor(kmeans.labels_).to(sparse_voxel.device)
+            #     cluster_centers = torch.tensor(kmeans.cluster_centers_).to(sparse_voxel.device)
+                
+            #     voxel_feats = []
+            #     voxel_pos = []
+                
+            #     for cluster_idx in range(n_clusters):
+            #         cluster_voxels_indices = (cluster_labels == cluster_idx)
+
+            #         cluster_voxels = batch_feature[cluster_voxels_indices]
+            #         cluster_pos = batch_pos[cluster_voxels_indices]
+
+            #         distances = torch.norm(cluster_voxels - torch.tensor(cluster_centers[cluster_idx]), dim=1)
+            #         cl_voxel_index = torch.argmin(distances).item()
+                    
+            #         voxel_pos.append(cluster_pos[cl_voxel_index])
+            #         voxel_feats.append(cluster_voxels[cl_voxel_index])
+
+            #     selected_feats.append(torch.stack(voxel_feats))
+            #     selected_pos.append(torch.stack(voxel_pos))
+
+            # selected_feats = torch.stack(selected_feats)  # (bs, 100, C)
+            # selected_pos = torch.stack(selected_pos)
+            ##################################################
+
+            for _ in range(self.num_levels):
+                sparse_voxel = self.inst_lvl_self_attn(
+                    query = sparse_voxel,
+                    query_pos = sparse_pos_enc,
+                    key = selected_feats,
+                    key_pos = selected_pos,
+                    value = selected_feats,
+                )
+
+            ### sparse_voxel: Bs, N, C
+            ### occ_index: [Bs][N][3]
+
+            # bs, D, W, H, C = occ_feat.shape
+            # output = torch.zeros(
+            #     [bs, D, W, H, C]
+            # ).cuda()
+
+            # for i in range(bs):   
+            #     index = occ_index[i]
+            #     d_indices = index[:, 0]
+            #     w_indices = index[:, 1]
+            #     h_indices = index[:, 2]
+            #     output[i, d_indices, w_indices, h_indices] = sparse_voxel[i, :len(index)] # bs, D, W, H, C
+
+            # #for 50x50x4 to 100x100x8
+            # # bev_feat = self.upsample3d(bev_feat)
+
+            # output = [output.permute(0, 4, 1, 2, 3)] # bs, C, D, W, H
+
+            return_map['sparse_idx']= occ_index
+            return_map['sparse_feat'] = sparse_voxel
+#######################################################################################################
+
+        # Fuse History
+        # bev_feat = self.fuse_history(bev_feat, img_metas, img[6])
+        
+        #bev_feat = self.bev_encoder(bev_feat)
+        # return_map['img_bev_feat'] = output
+
+        return return_map
+
+    def extract_lidar_bev_feat(self, pts, img_feats, img_metas):
+        """Extract features of points."""
+
+        voxels, num_points, coors = self.voxelize(pts)
+
+        voxel_features = self.pts_voxel_encoder(voxels, num_points, coors)
+        batch_size = coors[-1, 0] + 1
+        bev_feat = self.pts_middle_encoder(voxel_features, coors, batch_size)
+        bev_feat = self.bev_encoder(bev_feat)
+        return bev_feat
+
+    def extract_feat(self, points, img, img_metas, **kwargs):
+        """Extract features from images and points."""
+        results={}
+        if img is not None and self.with_specific_component('image_encoder'):
+            results.update(self.extract_img_bev_feat(img, img_metas, **kwargs))
+        if points is not None and self.with_specific_component('pts_voxel_encoder'):
+            results['lidar_bev_feat'] = self.extract_lidar_bev_feat(points, img, img_metas)
+
+        return results
+
+
+    def forward_train(self,
+                      points=None,
+                      img_metas=None,
+                      gt_bboxes_3d=None,
+                      gt_labels_3d=None,
+                      gt_labels=None,
+                      gt_bboxes=None,
+                      img_inputs=None,
+                      proposals=None,
+                      gt_bboxes_ignore=None,
+                      gt_occupancy_flow=None,
+                      **kwargs):
+        """Forward training function.
+
+        Args:
+            points (list[torch.Tensor], optional): Points of each sample.
+                Defaults to None.
+            img_metas (list[dict], optional): Meta information of each sample.
+                Defaults to None.
+            gt_bboxes_3d (list[:obj:`BaseInstance3DBoxes`], optional):
+                Ground truth 3D boxes. Defaults to None.
+            gt_labels_3d (list[torch.Tensor], optional): Ground truth labels
+                of 3D boxes. Defaults to None.
+            gt_labels (list[torch.Tensor], optional): Ground truth labels
+                of 2D boxes in images. Defaults to None.
+            gt_bboxes (list[torch.Tensor], optional): Ground truth 2D boxes in
+                images. Defaults to None.
+            img (torch.Tensor optional): Images of each sample with shape
+                (N, C, H, W). Defaults to None.
+            proposals ([list[torch.Tensor], optional): Predicted proposals
+                used for training Fast RCNN. Defaults to None.
+            gt_bboxes_ignore (list[torch.Tensor], optional): Ground truth
+                2D boxes in images to be ignored. Defaults to None.
+
+        Returns:
+            dict: Losses of different branches.
+        """
+
+
+        results= self.extract_feat(
+            points, img=img_inputs, img_metas=img_metas, **kwargs)
+        losses = dict()
+
+        if  self.with_pts_bbox:
+            losses_pts = self.forward_pts_train(results['img_bev_feat'], gt_bboxes_3d,
+                                            gt_labels_3d, img_metas,
+                                            gt_bboxes_ignore)
+            losses.update(losses_pts)
+            
+        if self.with_specific_component('occupancy_head'):
+            losses_occupancy = self.occupancy_head.forward_train(results['sparse_feat'], results=results, gt_occupancy=kwargs['gt_occupancy'], cam_mask=kwargs['cam_visible_mask'], gt_occupancy_flow=gt_occupancy_flow, sparse=True)
+            losses.update(losses_occupancy)
+
+        if self.with_specific_component('frpn'):
+            losses_mask = self.frpn.get_bev_mask_loss(kwargs['gt_bev_mask'], results['bev_mask_logit'])
+            losses.update(losses_mask)
+
+        if self.use_depth_supervision and self.with_specific_component('depth_net'):
+            loss_depth = self.depth_net.get_depth_loss(kwargs['gt_depth'], results['depth'])
+            losses.update(loss_depth)
+
+        return losses
+
+    def forward_test(self,
+                     points=None,
+                     img_metas=None,
+                     img_inputs=None,
+                     **kwargs):
+        """
+        Args:
+            points (list[torch.Tensor]): the outer list indicates test-time
+                augmentations and inner torch.Tensor should have a shape NxC,
+                which contains all points in the batch.
+            img_metas (list[list[dict]]): the outer list indicates test-time
+                augs (multiscale, flip, etc.) and the inner list indicates
+                images in a batch
+            img (list[torch.Tensor], optional): the outer
+                list indicates test-time augmentations and inner
+                torch.Tensor should have a shape NxCxHxW, which contains
+                all images in the batch. Defaults to None.
+        """
+        self.do_history = True
+        if img_inputs is not None:
+            for var, name in [(img_inputs, 'img_inputs'),
+                          (img_metas, 'img_metas')]:
+                if not isinstance(var, list) :
+                    raise TypeError('{} must be a list, but got {}'.format(
+                        name, type(var)))        
+            num_augs = len(img_inputs)
+            if num_augs != len(img_metas):
+                raise ValueError(
+                    'num of augmentations ({}) != num of image meta ({})'.format(
+                        len(img_inputs), len(img_metas)))
+
+            if num_augs==1 and not img_metas[0][0].get('tta_config', dict(dist_tta=False))['dist_tta']:
+                return self.simple_test(points[0], img_metas[0], img_inputs[0],
+                                    **kwargs)
+            else:
+                return self.aug_test(points, img_metas, img_inputs, **kwargs)
+        
+        elif points is not None:
+            img_inputs = [img_inputs] if img_inputs is None else img_inputs
+            points = [points] if points is None else points
+            return self.simple_test(points[0], img_metas[0], img_inputs[0],
+                                    **kwargs)
+        
+    def aug_test(self,points,
+                    img_metas,
+                    img_inputs=None,
+                    visible_mask=[None],
+                    **kwargs):
+        """Test function without augmentaiton."""
+        assert False
+        return None
+
+    def simple_test(self,
+                    points,
+                    img_metas,
+                    img=None,
+                    rescale=False,
+                    visible_mask=[None],
+                    return_raw_occ=False,
+                    **kwargs):
+        """Test function without augmentaiton."""
+        results = self.extract_feat(
+            points, img=img, img_metas=img_metas, **kwargs)
+        
+
+        bbox_list = [dict() for _ in range(len(img_metas))]
+        
+        if  self.with_pts_bbox:
+            bbox_pts = self.simple_test_pts(results['img_bev_feat'], img_metas, rescale=rescale)
+        else:
+            bbox_pts = [None for _ in range(len(img_metas))]
+
+
+        if self.with_specific_component('occupancy_head'):
+            # t=time.time()
+            pred_occupancy = self.occupancy_head.forward_sparse(results['sparse_feat'], results['sparse_idx'], **kwargs)['output_voxels'][0]
+            # print(f"\nHead time:{time.time()-t}")
+
+            pred_occupancy = pred_occupancy.permute(0, 2, 3, 4, 1)[0]
+            # if self.fix_void:
+            #     pred_occupancy = pred_occupancy[..., 1:]     
+            pred_occupancy = pred_occupancy.softmax(-1)
+
+
+            # convert to CVPR2023 Format
+            pred_occupancy = pred_occupancy.permute(3, 2, 0, 1)
+            pred_occupancy = torch.flip(pred_occupancy, [2])
+            pred_occupancy = torch.rot90(pred_occupancy, -1, [2, 3])
+            pred_occupancy = pred_occupancy.permute(2, 3, 1, 0)
+            
+            if return_raw_occ:
+                pred_occupancy_category = pred_occupancy
+            else:
+                pred_occupancy_category = pred_occupancy.argmax(-1)
+            t=time.time()
+
+            # # do not change the order
+            # if self.occupancy_save_path is not None:
+            #     scene_name = img_metas[0]['scene_name']
+            #     sample_token = img_metas[0]['sample_idx']
+            #     mask_camera = visible_mask[0][0]
+            #     masked_pred_occupancy = pred_occupancy[mask_camera].cpu().numpy()
+            #     save_path = os.path.join(self.occupancy_save_path, 'occupancy_pred', scene_name+'_'+sample_token)
+            #     np.savez_compressed(save_path, pred=masked_pred_occupancy, sample_token=sample_token) 
+
+
+            # For test server
+            if self.occupancy_save_path is not None:
+                    scene_name = img_metas[0]['scene_name']
+                    sample_token = img_metas[0]['sample_idx']
+                    # mask_camera = visible_mask[0][0]
+                    # masked_pred_occupancy = pred_occupancy[mask_camera].cpu().numpy()
+                    save_pred_occupancy = pred_occupancy.argmax(-1).cpu().numpy()
+                    save_path = os.path.join(self.occupancy_save_path, 'occupancy_pred', f'{sample_token}.npz')
+                    np.savez_compressed(save_path, save_pred_occupancy.astype(np.uint8)) 
+
+            pred_occupancy_category= pred_occupancy_category.cpu().numpy()
+
+        else:
+            pred_occupancy_category =  None
+
+        if results.get('bev_mask_logit', None) is not None:
+            pred_bev_mask = results['bev_mask_logit'].sigmoid() > 0.5
+            iou = IOU(pred_bev_mask.reshape(1, -1), kwargs['gt_bev_mask'][0].reshape(1, -1)).cpu().numpy()
+        else:
+            iou = None
+
+        assert len(img_metas) == 1
+        for i, result_dict in enumerate(bbox_list):
+            result_dict['pts_bbox'] = bbox_pts[i]
+            result_dict['iou'] = iou
+            result_dict['pred_occupancy'] = pred_occupancy_category
+            result_dict['index'] = img_metas[0]['index']
+        return bbox_list, t
+
+    def forward_dummy(self,
+                      points=None,
+                      img_metas=None,
+                      img_inputs=None,
+                      **kwargs):
+        results = self.extract_feat(
+            points, img=img_inputs, img_metas=img_metas, **kwargs)
+        assert self.with_pts_bbox
+        outs = self.pts_bbox_head(results['img_bev_feat'])
+        return outs

@@ -41,36 +41,35 @@ class UpsampleLayer(nn.Module):
 
 @NECKS.register_module()
 class BEV2DFCN(nn.Module):
-    def __init__(self, flatten_height, height, in_channels, out_channels):
+    def __init__(self, flatten_height, height, in_channels, mid_channels, out_channels):
         super(BEV2DFCN, self).__init__()
         self.flatten_height = flatten_height
-        self.in_channels = in_channels
-        # self.conv0 = nn.Conv2d(self.in_channels*height, self.in_channels, kernel_size=1)
-        self.conv1 = nn.Conv2d(self.in_channels*height, out_channels, kernel_size=1)
-        # self.bn_flat0 = nn.BatchNorm2d(self.in_channels*height/2)
+        self.conv0 = nn.Conv2d(in_channels*height, mid_channels, kernel_size=3, stride=1, padding=1)
+        self.conv1 = nn.Conv1d(mid_channels, out_channels, kernel_size=1)
+        self.conv2 = nn.Conv1d(mid_channels, height, kernel_size=1)####################
+        self.bn_flat0 = nn.BatchNorm2d(mid_channels)
         self.bn_flat1 = nn.BatchNorm2d(out_channels)
+        self.bn_flat2 = nn.BatchNorm2d(height)
         self.gelu = nn.GELU()
-        self.encoder1 = nn.Conv2d(out_channels, out_channels*2, kernel_size=3, stride=2, padding=1)
-        self.encoder2 = nn.Conv2d(out_channels*2, out_channels*4, kernel_size=3, stride=2, padding=1)
-        self.decoder1 = UpsampleLayer(2, 'bilinear', in_channels=out_channels*4, out_channels=out_channels*2, convtype='2d')
-        self.decoder2 = UpsampleLayer(2, 'bilinear', in_channels=out_channels*2, out_channels=out_channels, convtype='2d')
+        self.encoder1 = nn.Conv2d(mid_channels, mid_channels*2, kernel_size=4, stride=2, padding=1)
+        self.encoder2 = nn.Conv2d(mid_channels*2, mid_channels*4, kernel_size=4, stride=2, padding=1)
+        self.decoder1 = nn.ConvTranspose2d(mid_channels*4, mid_channels*2, kernel_size=4, stride=2, padding=1)
+        self.decoder2 = nn.ConvTranspose2d(mid_channels*2, mid_channels, kernel_size=4, stride=2, padding=1)
+        # self.decoder1 = UpsampleLayer(2, 'bilinear', in_channels=mid_channels*4, out_channels=mid_channels*2, convtype='2d')
+        # self.decoder2 = UpsampleLayer(2, 'bilinear', in_channels=mid_channels*2, out_channels=mid_channels, convtype='2d')
+
         # self.encoder1 = AggregationBlock(out_channels, out_channels*2)
         # self.encoder2 = AggregationBlock(out_channels*2, out_channels*4)
         
-        # self.decoder1 = nn.ConvTranspose2d(out_channels*4, out_channels*2, padding=1, kernel_size=4, stride=2)
-        # self.decoder2 = nn.ConvTranspose2d(out_channels*2, out_channels, padding=1, kernel_size=4, stride=2)
-        
         # Batch Normalization
-        self.bn1 = nn.BatchNorm2d(out_channels*2)
-        self.bn2 = nn.BatchNorm2d(out_channels*4)
-        self.bn3 = nn.BatchNorm2d(out_channels*2)
-        self.bn4 = nn.BatchNorm2d(out_channels)
+        self.bn1 = nn.BatchNorm2d(mid_channels*2)
+        self.bn2 = nn.BatchNorm2d(mid_channels*4)
+        self.bn3 = nn.BatchNorm2d(mid_channels*2)
+        self.bn4 = nn.BatchNorm2d(mid_channels)
 
     def forward(self, x):
         if self.flatten_height:
-            # x = self.bn_flat0(self.conv0(x))
-            x = self.bn_flat1(self.conv1(x))
-            x = self.gelu(x)
+            x = self.gelu(self.bn_flat0(self.conv0(x)))
         
         # Downsample
         # e1 = self.encoder1(x)
@@ -83,8 +82,13 @@ class BEV2DFCN(nn.Module):
         d1 = d1 + e1
         d2 = self.gelu(self.bn4(self.decoder2(d1)))
         out = d2 + x
+        bs, _, D, W = out.shape
 
-        return out
+        feat_out = self.gelu(self.bn_flat1(self.conv1(out.flatten(2, 3)))).reshape(bs, -1, D, W) # bs, C, D, W
+        bev_h = self.gelu(self.bn_flat2(self.conv2(out.flatten(2, 3)))).reshape(bs, -1, D, W).permute(0, 2, 3, 1) # bs, H, D, W => bs, D, W, H
+        bev_h = bev_h.sigmoid()
+
+        return feat_out, bev_h
 
 ######## Original FCN2D ################
 # @NECKS.register_module()
@@ -184,10 +188,10 @@ class OcclusionMask(nn.Module):
         return mask  
     
 @NECKS.register_module()
-class SparseCHconv(nn.Module):
+class SparseConv3D(nn.Module):
     def __init__(self, in_channel=None, out_channel = None):
-        super(SparseCHconv, self).__init__()
-        self.spconv2d = spconv.SparseConv2d(in_channels=in_channel, out_channels=out_channel, kernel_size=3, stride=1, padding=1)
+        super(SparseConv3D, self).__init__()
+        self.spconv3d = spconv.SparseConv3d(in_channels=in_channel, out_channels=out_channel, kernel_size=3, stride=1, padding=1)
 
     def forward(self, input_tensor=None):
         # input: bs, C*H, D, W

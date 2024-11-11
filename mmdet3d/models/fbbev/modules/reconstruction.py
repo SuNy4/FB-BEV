@@ -15,10 +15,9 @@ class SphericalPositionalEncodingWithView(torch.nn.Module):
     def __init__(self, max_radius=40, num_freqs=8):
         super(SphericalPositionalEncodingWithView, self).__init__()
         self.num_freqs = num_freqs
-        self.max_radius = max_radius
         self.freq_bands = 2.0 ** torch.linspace(0, num_freqs - 1, num_freqs).cuda()
     
-    def forward(self, coords, encode_theta=False, theta_only=False):
+    def forward(self, coords, img_encode=False, encode_theta=False, theta_only=False):
         """
         Args:
             coords: Tensor of shape (N, 3) representing (r, theta, phi) coordinates in 3D space.
@@ -26,34 +25,62 @@ class SphericalPositionalEncodingWithView(torch.nn.Module):
         Returns:
             pos_enc: (N, num_freqs * 6)
         """
-        if theta_only:
-            theta = coords[..., 1]
-            encoded_theta = torch.cat([torch.sin(self.freq_bands[None, :] * theta[:, None]),
-                                       torch.cos(self.freq_bands[None, :] * theta[:, None])], dim=-1)
-            return encoded_theta
-    
-        else:
-            r, theta, phi, h = coords[..., 0], coords[..., 1], coords[..., 2], coords[..., 3]
-            r_max = r.max()
+        x_list = []
+        for i in range(coords.shape[-1]):
+            x = coords[..., i]
+            x_min, x_max = x.min(), x.max()
+            x = (x - x_min) / (x_max - x_min + 1e-8)
 
-            r_normalized = r / (r_max + 1e-8)
-            encoded_r = torch.cat([torch.sin(self.freq_bands[None, :] * r_normalized[:, None]),
-                                   torch.cos(self.freq_bands[None, :] * r_normalized[:, None])], dim=-1)
-
-            encoded_phi = torch.cat([torch.sin(self.freq_bands[None, :] * phi[:, None]),
-                                     torch.cos(self.freq_bands[None, :] * phi[:, None])], dim=-1)
-            
-            encoded_h = torch.cat([torch.sin(self.freq_bands[None, :] * h[:, None]),
-                                   torch.cos(self.freq_bands[None, :] * h[:, None])], dim=-1)
-            if encode_theta:
-                encoded_theta = torch.cat([torch.sin(self.freq_bands[None, :] * theta[:, None]),
-                                           torch.cos(self.freq_bands[None, :] * theta[:, None])], dim=-1)
+            if img_encode:
+                x = torch.cat([torch.sin(self.freq_bands[None, None, :] * x[..., None]),
+                                torch.cos(self.freq_bands[None, None, :] * x[..., None])], dim=-1)
+            else:
+                x = torch.cat([torch.sin(self.freq_bands[None, :] * x[:, None]),
+                                torch.cos(self.freq_bands[None, :] * x[:, None])], dim=-1)
+            x_list.append(x)
         
-                pos_enc = torch.cat([encoded_r, encoded_phi, encoded_h, encoded_theta], dim=-1).cuda()
-                return pos_enc
+        pos_enc = torch.cat(x_list, dim=-1).cuda()
+
+        # if theta_only:
+        #     theta = coords[..., 1]
+        #     theta_min, theta_max = theta.min(), theta.max()
+        #     encoded_theta = torch.cat([torch.sin(self.freq_bands[None, :] * theta[:, None]),
+        #                                torch.cos(self.freq_bands[None, :] * theta[:, None])], dim=-1)
+        #     return encoded_theta
+    
+        # else:
+        #     r, theta, phi, h = coords[..., 0], coords[..., 1], coords[..., 2], coords[..., 3]
+        #     r_max, r_min = r.max(), r.min()
+        #     theta_min, theta_max = theta.min(), theta.max()
+        #     phi_min, phi_max = phi.min(), phi.max()
+        #     h_min, h_max = h.min(), h.max()
+
+        #     # 0~1 normalize
+        #     r = (r - r_min) / (r_max - r_min + 1e-8)
+        #     h = (h - h_min) / (h_max - h_min + 1e-8)
             
-            pos_enc = torch.cat([encoded_r, encoded_phi, encoded_h], dim=-1).cuda()
-            return pos_enc
+        #     #-1~1 normalize
+        #     theta = 2 * (theta - theta_min) / (theta_max - theta_min + 1e-8) - 1
+        #     phi = 2 * (phi - phi_min) / (phi_max - phi_min + 1e-8) - 1
+            
+
+        #     encoded_r = torch.cat([torch.sin(self.freq_bands[None, :] * r[:, None]),
+        #                            torch.cos(self.freq_bands[None, :] * r[:, None])], dim=-1)
+
+        #     encoded_phi = torch.cat([torch.sin(self.freq_bands[None, :] * phi[:, None]),
+        #                              torch.cos(self.freq_bands[None, :] * phi[:, None])], dim=-1)
+            
+        #     encoded_h = torch.cat([torch.sin(self.freq_bands[None, :] * h[:, None]),
+        #                            torch.cos(self.freq_bands[None, :] * h[:, None])], dim=-1)
+        #     if encode_theta:
+        #         encoded_theta = torch.cat([torch.sin(self.freq_bands[None, :] * theta[:, None]),
+        #                                    torch.cos(self.freq_bands[None, :] * theta[:, None])], dim=-1)
+        
+        #         pos_enc = torch.cat([encoded_r, encoded_phi, encoded_h, encoded_theta], dim=-1).cuda()
+        #         return pos_enc
+            
+        #     pos_enc = torch.cat([encoded_r, encoded_phi, encoded_h], dim=-1).cuda()
+        return pos_enc
         
 ############################# Using Local pos encode
 @NECKS.register_module()
@@ -73,6 +100,7 @@ class PosDeformableTransformerLayer(nn.Module):
                  **kwargs):
         super().__init__()
         self.num_levels=num_levels
+        # self.learnable_pos = nn.Embedding(80000, 128)
         self.cam_pairs = [(0, 1), (1, 2), (2, 3), (3, 4), (5, 0)]
         self.x_bound = grid_config['x']
         self.y_bound = grid_config['y']
@@ -146,11 +174,10 @@ class PosDeformableTransformerLayer(nn.Module):
         y = grid_coords[..., 1] # W
         z = grid_coords[..., 2] # H
         
-        r = torch.sqrt(x**2 + y**2 + z**2)  # Distance from the origin
-        theta = torch.atan2(y, x)  # Angle in the xy-plane
-        phi = torch.atan2(z, torch.sqrt(x**2 + y**2))  # Angle with respect to z-axis
-        
-        # Stack spherical coordinates
+        r = torch.sqrt(x**2 + y**2 + z**2)
+        theta = torch.atan2(y, x)
+        phi = torch.atan2(z, torch.sqrt(x**2 + y**2))
+
         spherical_coords = torch.stack([r, theta, phi], dim=-1)
         return spherical_coords
     
@@ -234,6 +261,7 @@ class PosDeformableTransformerLayer(nn.Module):
                 spatial_shapes=None,
                 level_start_index=None,
                 cam_params=None,
+                attn_level=None,
                 ):
 
         # View Transformation
@@ -241,8 +269,6 @@ class PosDeformableTransformerLayer(nn.Module):
 
         if view_transform:
             indexes = [[] for _ in range(bs)]
-            overlapped_indexes = []
-            pos_encode_indexes = [[] for _ in range(bs)]
 
             # D, W, H, 3 (x, y, z cartesian)
             wrld_ref_3d = self.get_reference_points(
@@ -251,32 +277,63 @@ class PosDeformableTransformerLayer(nn.Module):
                 dtype=torch.float
                 )
             D, W, H, _ = wrld_ref_3d.shape
-            
-            # D, W, H, 4 (r, theta, phi, h: spherical) for pos encode
-            h = wrld_ref_3d[..., -1].unsqueeze(-1)
-            sph_ref_pts = torch.cat([self.cartesian_to_spherical(wrld_ref_3d), h], dim=-1)
 
-            global_pos_encode = self.pos_encoder(sph_ref_pts.flatten(0, 2), encode_theta=True).reshape(D, W, H, -1) # D, W, H, embed_dim
-            local_pos_encode = self.pos_encoder(sph_ref_pts.flatten(0, 2), encode_theta=False).reshape(D, W, H, -1)
-            
-            # ref_pts: Ncam, bs, D, W, H, 2 (x, y pixel coords)
-            # per_cam_mask_list: Ncam, bs, D, W, H (boolean)
             ref_pts_3d, ref_pts, per_cam_mask_list, cam_pts = self.point_sampling(
                 wrld_ref_3d, cam_params=cam_params)
             
-            overlap = []
+            # D, W, H, 4 (r, theta, phi, z: spherical) for pos encode
+            h = wrld_ref_3d[..., -1].unsqueeze(-1)
+            sph_ref_pts = torch.cat([self.cartesian_to_spherical(wrld_ref_3d), h], dim=-1)
+            # D, W, H, 4, (r, x, y, z)
+            wrld_ref_3d = torch.cat([sph_ref_pts[..., 0].unsqueeze(-1), wrld_ref_3d], dim=-1)
+            cartisian_pos_encode = self.pos_encoder(wrld_ref_3d.flatten(0, 2)).reshape(D, W, H, -1) # D, W, H, embed_dim
+            
+            # ref_pts: Ncam, bs, D, W, H, 2 (x, y pixel coords)
+            # per_cam_mask_list: Ncam, bs, D, W, H (boolean)
+            ##########################################################################################
+            # global_pos_encode = self.pos_encoder(sph_ref_pts.flatten(0, 2), encode_theta=True).reshape(D, W, H, -1) # D, W, H, embed_dim
+            # # global_pos_encode = self.learnable_pos.weight.unsqueeze(0).reshape(D, W, H, -1)
+            # # import numpy as np
+            # # vis_target = np.uint8(global_pos_encode.cpu().numpy())
+            # # np.save('learnbale_pos.npy', vis_target)
+            # # assert False
+            # num_cams = ref_pts.shape[0]
+            # max_len = 0
+            
+            # for j in range(bs):
+            #     for i, per_cam_mask in enumerate(per_cam_mask_list):
+            #         index_query_per_img = per_cam_mask[j].nonzero().squeeze(-1)
+            #         if len(index_query_per_img) == 0:
+            #             index_query_per_img = per_cam_mask_list[i][j].nonzero().squeeze(-1)[0:1]
+            #         indexes[j].append(index_query_per_img)
+            #         max_len = max(max_len, len(index_query_per_img))
 
-            for j in range(bs):
-                batch_overlap = []
-                for pair in self.cam_pairs:
-                    cam1, cam2 = pair
-                    mask1 = per_cam_mask_list[cam1, j]
-                    mask2 = per_cam_mask_list[cam2, j]
-                    per_batch = (mask1 * mask2).unsqueeze(0) # 1, D, W, H boolean
-                    batch_overlap.append(per_batch)
-                batch_overlap = torch.any(torch.cat(batch_overlap, dim=0), dim=0)
-                overlap.append(batch_overlap)
-                
+            # global_pos_per_cam = torch.zeros(
+            #     [bs, num_cams, max_len, self.embed_dims]
+            #     ).cuda()
+            
+            # reference_points_rebatch = torch.zeros(
+            #     [bs, num_cams, max_len, 2]
+            #     ).cuda()
+            
+            # for j in range(bs):
+            #     for i, reference_points_per_img in enumerate(ref_pts):   
+            #         index_query_per_img = indexes[j][i]
+            #         d_indices = index_query_per_img[:, 0]
+            #         w_indices = index_query_per_img[:, 1]
+            #         h_indices = index_query_per_img[:, 2]
+            #         reference_points_rebatch[j, i, :len(index_query_per_img)] = reference_points_per_img[j, d_indices, w_indices, h_indices]
+            #         global_pos_per_cam[j, i, :len(index_query_per_img)] = global_pos_encode[d_indices, w_indices, h_indices]
+
+            # query = global_pos_per_cam.flatten(start_dim=0, end_dim=1).float()
+            # ref_pts = reference_points_rebatch.flatten(start_dim=0, end_dim=1).unsqueeze(2).repeat(1, 1, self.num_levels, 1)
+
+
+            # Using Local pos encode
+            ###################################################################################
+            local_pos_encode = self.pos_encoder(sph_ref_pts.flatten(0, 2)[..., [0, 2, 3]]).reshape(D, W, H, -1)
+            pos_encode_indexes = [[] for _ in range(bs)]
+
             num_cams = ref_pts.shape[0]
             max_len = 0
             
@@ -285,8 +342,6 @@ class PosDeformableTransformerLayer(nn.Module):
             # Make positional encoding per cam: [bs][Ncam] list (N, pos_encode_embed_dim) size
             # Overlapped indexes: [bs][Noverlap][3]
             for j in range(bs):
-                overlap_per_batch = overlap[j].nonzero()
-                overlapped_indexes.append(overlap_per_batch)
                 for i, per_cam_mask in enumerate(per_cam_mask_list):
                     index_query_per_img = per_cam_mask[j].nonzero().squeeze(-1)
                     if len(index_query_per_img) == 0:
@@ -300,7 +355,7 @@ class PosDeformableTransformerLayer(nn.Module):
                     if i == 4:
                         local_pos[local_pos[..., 1] < 0] += 2*torch.pi
                     local_pos[..., 1] -= self.cam_theta[i] * torch.pi /180
-                    theta = self.pos_encoder(local_pos, theta_only = True)
+                    theta = self.pos_encoder(local_pos[..., 1].unsqueeze(-1))
                     local_encode = torch.cat([local_encode, theta], dim=-1)
                     pos_encode_indexes[j].append(local_encode)
                     ####################################################
@@ -335,24 +390,25 @@ class PosDeformableTransformerLayer(nn.Module):
             # query = queries_rebatch.flatten(start_dim=0, end_dim=1).float()
             query = local_pos_per_cam.flatten(start_dim=0, end_dim=1).float()
             ref_pts = reference_points_rebatch.flatten(start_dim=0, end_dim=1).unsqueeze(2).repeat(1, 1, self.num_levels, 1)
-
-            # Value: Bs, Ncam, C, H, W => Bs*Ncam, H*W, C
-            value = value.flatten(start_dim=0, end_dim=1).flatten(start_dim=2, end_dim=3).permute(0,2,1).float()
+            ###################################################################################################################
+        
+        # Value: Bs, Ncam, C, H, W => Bs*Ncam, H*W, C
+        value = value.flatten(start_dim=0, end_dim=1).flatten(start_dim=2, end_dim=3).permute(0,2,1).float()
 
         if bev_value:
             ref_pts = ref_pts.unsqueeze(2).repeat(1, 1, self.num_levels, 1)[..., :2]
 
         if occ_value:
             ref_pts = ref_pts.unsqueeze(2).repeat(1, 1, self.num_levels, 1)
-
-        query = self.attn(
-            query,
-            value=value,
-            # query_pos=query_pos,
-            reference_points=ref_pts,
-            spatial_shapes=spatial_shapes,
-            level_start_index=level_start_index
-            )
+        for _ in range(attn_level):
+            query = self.attn(
+                query,
+                value=value,
+                query_pos=query_pos,
+                reference_points=ref_pts,
+                spatial_shapes=spatial_shapes,
+                level_start_index=level_start_index
+                )
         
         if not hasattr(self, 'ffn'):
             return query
@@ -360,7 +416,7 @@ class PosDeformableTransformerLayer(nn.Module):
 
         if view_transform:
             query = query.reshape(bs, num_cams, -1, self.embed_dims)
-            return query, indexes, overlapped_indexes, global_pos_encode
+            return query, indexes, cartisian_pos_encode # global_pos_encode
             # return query, indexes, overlapped_indexes, global_pos_per_cam, output_map, global_pos_encode
         
         else:
@@ -504,23 +560,26 @@ class ASPP(nn.Module):
 
 
 @NECKS.register_module()
-class cam_feat_encoder(nn.Module):
+class CamFeatEncoder(nn.Module):
     def __init__(self, in_channel, out_channel):
+        super(CamFeatEncoder, self).__init__()
         self.aspp = ASPP(in_channel, out_channel)
     
     def forward(self, x):
+        bs, Ncam, _, H, W = x.shape
         x = x.flatten(0, 1)
-        x = self.aspp(x)
+        x = self.aspp(x).reshape(bs, Ncam, -1, H, W)
 
         return x
 
 
 @NECKS.register_module()
 class CamPosEncoder(nn.Module):
-    def __init__(self, data_config = None, grid_config = None):
+    def __init__(self, data_config = None, grid_config = None, num_freqs = None,):
         super(CamPosEncoder, self).__init__()
         self.original_dim=data_config['input_size']
-        self.cam_theta = grid_config['Cam_Setting']
+        self.cam_theta = grid_config['Cam_Setting'] 
+        self.encoder = SphericalPositionalEncodingWithView(num_freqs=num_freqs)
         
     def img_to_spherical(self, img_grid, intrinsic, rotation, trans, post_rotation, post_trans, bda, cam_theta):
         """
@@ -548,22 +607,15 @@ class CamPosEncoder(nn.Module):
 
         img_coords = intrinsic.inverse().view(bs, Ncam, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
 
-        # img_coords = rotation.view(bs, Ncam, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
-
+        img_coords = rotation.view(bs, Ncam, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
         # img_coords += trans.view(bs, Ncam, 1, 3)
 
         final_coords = bda.view(bs, 1, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
 
-        W, H, D = final_coords[..., 0], final_coords[..., 1], final_coords[..., 2]
-        print(W, H, D)
+        D, W, H = final_coords[..., 0], final_coords[..., 1], final_coords[..., 2]
         theta = torch.atan2(W, D)  # Shape (bs, ncam, H*W)
         phi = torch.atan2(H, torch.sqrt(D**2 + W**2))  # Shape (bs, ncam, H*W)
 
-        for i, theta_cam in enumerate(cam_theta):
-            # theta[:, i] -= theta_cam
-            print(min(theta[0][i]), max(theta[0][i]))
-        print(phi)
-        assert False
         return theta, phi
 
     def forward(self, img_context, rot, tran, intrin, post_rot, post_tran, bda):
@@ -571,21 +623,21 @@ class CamPosEncoder(nn.Module):
         dwn_ratio = self.original_dim[0] // H
         assert (self.original_dim[0] // H) == (self.original_dim[1] // W)
 
-        # intrin[..., 0, 0] /= dwn_ratio
-        # intrin[..., 1, 1] /= dwn_ratio
-        # intrin[..., 0, 2] /= dwn_ratio
-        # intrin[..., 1, 2] /= dwn_ratio
-
         u = torch.linspace(0, W - 1, W).to(img_context.device)
         v = torch.linspace(0, H - 1, H).to(img_context.device)
 
         u, v = torch.meshgrid(u, v, indexing='ij')
-        img_grid = torch.stack([u, v], dim=-1).flatten(0, 1) * dwn_ratio
-        # print(rot, post_rot)
-        # print(intrin)
-        # print(tran, bda, post_tran)
+        img_grid = torch.stack([v, u], dim=-1).flatten(0, 1) * dwn_ratio
  
         img_grid = img_grid[None, None, :].expand(bs, Ncam, H*W, 2)
         theta, phi = self.img_to_spherical(img_grid, intrin, rot, tran, post_rot, post_tran, bda, self.cam_theta)
+        target = torch.cat([theta.unsqueeze(-1), phi.unsqueeze(-1)], dim=-1) # bs, Ncam, H*W, 2
+        
+        target_list = []
+        for i in range(bs):
+            target_per_batch = self.encoder(target[i], img_encode=True)
+            target_list.append(target_per_batch.unsqueeze(0))
+            
+        target = torch.cat(target_list, dim=0).reshape(bs, Ncam, H, W, -1)
 
-        return theta
+        return target

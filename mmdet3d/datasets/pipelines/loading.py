@@ -186,13 +186,17 @@ class LoadOccupancy(object):
         occupancy_file_path = osp.join(self.occupancy_path, scene_name, sample_token, 'labels.npz')
         data = np.load(occupancy_file_path)
         occupancy = torch.tensor(data['semantics'])
-        visible_mask = torch.tensor(data[self.mask])
+        cam_visible_mask = torch.tensor(data['mask_camera'])
+        # visible_mask = torch.tensor(data[self.mask])
         # visible_mask_lidar = data['mask_lidar']
 
         if self.ignore_nonvisible:
             # occupancy[~visible_mask.to(torch.bool)] = 255
             # Need to make 255 with below condition because of instance occlusion
-            occupancy[(visible_mask==0) & (occupancy==17)] = 255
+            # occupancy[(visible_mask==0) & (occupancy==17)] = 255
+
+            # Make free area to 0 class
+            occupancy[occupancy==17] = 255
 
 
         # to BEVDet format
@@ -201,10 +205,16 @@ class LoadOccupancy(object):
         occupancy = torch.flip(occupancy, [1])
         occupancy = occupancy.permute(1, 2, 0)
 
+        cam_visible_mask = cam_visible_mask.permute(2, 0, 1)
+        cam_visible_mask = torch.rot90(cam_visible_mask, 1, [1, 2])
+        cam_visible_mask = torch.flip(cam_visible_mask, [1])
+        cam_visible_mask = cam_visible_mask.permute(1, 2, 0)
+
         ###############
         if self.fix_void:
             occupancy[occupancy<255] = occupancy[occupancy<255] + 1
             occupancy[occupancy==255] = 0
+            cam_visible_mask = cam_visible_mask & occupancy.bool()
         ###############
 
         for class_ in self.ignore_classes:
@@ -213,17 +223,21 @@ class LoadOccupancy(object):
         if results['rotate_bda'] != 0:
             occupancy = occupancy.permute(2, 0, 1)
             occupancy = rotate(occupancy, -results['rotate_bda'], fill=255).permute(1, 2, 0)
+            cam_visible_mask = cam_visible_mask.permute(2, 0, 1)
+            cam_visible_mask = rotate(cam_visible_mask, -results['rotate_bda'], fill=255).permute(1, 2, 0)
 
         if results['flip_dx']:
             occupancy = torch.flip(occupancy, [1])
+            cam_visible_mask = torch.flip(cam_visible_mask, [1])
 
         if results['flip_dy']:
             occupancy = torch.flip(occupancy, [0])
+            cam_visible_mask = torch.flip(cam_visible_mask, [0])
 
 
 
         results['gt_occupancy'] = occupancy
-        results['visible_mask'] = visible_mask
+        results['cam_visible_mask'] = cam_visible_mask
         
         results['visible_mask_bev'] = (occupancy==255).sum(-1)
 

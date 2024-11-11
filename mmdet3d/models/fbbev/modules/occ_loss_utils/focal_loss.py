@@ -208,6 +208,7 @@ class CustomFocalLoss(nn.Module):
                 target,
                 weight=None,
                 avg_factor=None,
+                semantic = False,
                 ignore_index=255,
                 reduction_override=None):
         """Forward function.
@@ -228,13 +229,21 @@ class CustomFocalLoss(nn.Module):
 
         c = self.c[None, :, :, None].repeat(B, 1, 1, D).reshape(-1)
 
-        visible_mask = (target!=ignore_index).reshape(-1).nonzero().squeeze(-1)
-        weight_mask = weight[None,:] * c[visible_mask, None]
-        # visible_mask[:, None]
+        if semantic:
+            visible_mask = (target!=ignore_index).reshape(-1).nonzero().squeeze(-1)
+            weight_mask = weight[None,:] * c[visible_mask, None]
+            target = target.reshape(-1)[visible_mask]
+            visible_mask[:, None]
+     
+            if len(pred.shape) == 5:
+                num_classes = pred.size(1)
+                pred = pred.permute(0, 2, 3, 4, 1).reshape(-1, num_classes)[visible_mask]
 
-        num_classes = pred.size(1)
-        pred = pred.permute(0, 2, 3, 4, 1).reshape(-1, num_classes)[visible_mask]
-        target = target.reshape(-1)[visible_mask]
+        else:
+            target[target !=0] = True
+            weight_mask = None
+            pred = pred.reshape(-1).unsqueeze(-1)
+            target = target.reshape(-1)
         
         assert reduction_override in (None, 'none', 'mean', 'sum')
         reduction = (

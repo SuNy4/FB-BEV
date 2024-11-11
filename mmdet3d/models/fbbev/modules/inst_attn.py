@@ -40,11 +40,12 @@ class TransformerLayer(nn.Module):
         if query_pos is not None:
             query = query + self.attn(self.norm1(query) + query_pos, key, value)[0]
         else:
-            query = query + self.attn(self.norm1(query), key, value)[0]
+            attn_results, weights = self.attn(self.norm1(query), key, value, need_weights=True)
+            query = query + attn_results
         if not hasattr(self, 'ffn'):
             return query
         query = query + self.ffn(self.norm2(query))
-        return query
+        return query, weights
 
 
 @NECKS.register_module()

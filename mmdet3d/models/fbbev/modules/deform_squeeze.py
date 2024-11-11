@@ -84,8 +84,7 @@ class DeformableSqueezeAttention(nn.Module):
         spatial_shapes_[:, target] *= spatial_shapes_[:, -1]
         spatial_shapes_ = spatial_shapes_[:, :-1]
 
-        reference_points_ = reference_points#.clone()
-        
+        reference_points_ = reference_points.clone()
         reference_points_[..., target] *= spatial_shapes[:, -1]
         reference_points_[..., target] += reference_points_[..., squeeze_axis]
         reference_points_[..., target].sigmoid()
