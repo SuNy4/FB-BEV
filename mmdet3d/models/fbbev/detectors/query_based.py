@@ -52,18 +52,18 @@ class FBOCC(CenterPoint):
                  img_bev_encoder_neck=None,
 
                  # Fast Instance Occ
-                 cam_pos_encoder = None,
-                 cam_feat_encoder = None,
-                 back_project=None,
-                 voxel_self_attn=None,
+                 pos_encoder = None,
+                 img_query_cross_attn=None,
+                 query_self_attn=None,
+                 global_pos_self_attn_L1=None,
+                 global_pos_self_attn_L2=None,
                  geometry_head=None,
                  inst_lvl_self_attn=None,
 
                  attn_level=None,
                  grid_config=None,
                  bev_fcn_encoder=None,
-                 img_query_cross_attn=None,
-
+                 
                  occ_self_attn=None,
                  keypoint=None,
 
@@ -81,6 +81,7 @@ class FBOCC(CenterPoint):
 
                  # other settings.
                  embed_dim=None,
+                 N_global_queries=None,
                  use_depth_supervision=False,
                  readd=False,
                  fix_void=False,
@@ -102,18 +103,18 @@ class FBOCC(CenterPoint):
         self.forward_projection = builder.build_neck(forward_projection) if forward_projection else None
         self.img_bev_encoder_backbone = builder.build_backbone(img_bev_encoder_backbone) if img_bev_encoder_backbone else None
         self.img_bev_encoder_neck = builder.build_neck(img_bev_encoder_neck) if img_bev_encoder_neck else None
-        self.img_query_cross_attn = builder.build_neck(img_query_cross_attn) if img_query_cross_attn else None
-
+        
         #FIOcc init
-        #self.object_embedd = nn.Embedding()
-        self.cam_pos_encoder = builder.build_neck(cam_pos_encoder) if cam_pos_encoder else None
-        self.cam_feat_encoder = builder.build_neck(cam_feat_encoder) if cam_feat_encoder else None
-        self.back_project = builder.build_neck(back_project) if back_project else None
+        self.main_queries = nn.Embedding(N_global_queries, embed_dim) if N_global_queries else None
+        self.pos_encoder = builder.build_neck(pos_encoder) if pos_encoder else None
+        self.img_query_cross_attn = builder.build_neck(img_query_cross_attn) if img_query_cross_attn else None
+        self.query_self_attn = builder.build_neck(query_self_attn) if query_self_attn else None
+        self.global_pos_self_attn_L1 = builder.build_neck(global_pos_self_attn_L1) if global_pos_self_attn_L1 else None
+        self.global_pos_self_attn_L2 = builder.build_neck(global_pos_self_attn_L2) if global_pos_self_attn_L2 else None
         self.bev_fcn_encoder = builder.build_neck(bev_fcn_encoder) if bev_fcn_encoder else None
-        self.voxel_self_attn = builder.build_neck(voxel_self_attn) if voxel_self_attn else None
         self.geometry_head = builder.build_neck(geometry_head) if geometry_head else None
-        self.inst_lvl_self_attn = builder.build_neck(inst_lvl_self_attn) if back_project else None
-        self.main_queries = nn.Embedding(50, 256)
+
+   
 
         # FC layer
 
@@ -354,46 +355,98 @@ class FBOCC(CenterPoint):
 
 #######################################################################################################
     ### OVerall Flow: 2D feature encode with global pos info -> 2D 3D deformable attention(Sim Loss) -> 3D deformable self attention -> Occupied MLP head(CE loss) -> Sparsified voxels(large norm self attention) -> MLP head -> Combine Map
-    
-    ### TODO: Global pos encode to img feature
-    ### TODO_append: Sparse Conv3d => instance level self attention으로 일단 대체(Temporal을 위해서 넘길만한 무언가를 빼줘야됨)
-    ### TODO: Combine in Head and Overlap area loss
     def extract_img_bev_feat(self, img, img_metas, **kwargs):
         """Extract features of images."""
 
         return_map = {}
 
-        context = self.image_encoder(img[0]) # Bs, Ncam, C, H, W
+        context = self.image_encoder(img[0]).permute(0, 1, 2, 4, 3) # bs, Ncam, C, W, H
 
-        cam_params = img[1:7]
-        #rot, tran, intrin, post_rot, post_tran, bda = *cam_params
+        cam_params = img[1:7] #rot, tran, intrin, post_rot, post_tran, bda: *cam_params
+        
+        # Local Image Pos Encode
+        if self.with_specific_component('pos_encoder'):
+            img_local_pos_encode = self.pos_encoder(context, *cam_params, mode='Local') # bs, Ncam, WH, num_freqs*4
+            img_local_pos_encode = img_local_pos_encode.flatten(0, 1) # bsNcam, WH, num_freqs*4
+
         if self.with_specific_component('img_query_cross_attn'):
-            bs, Ncam, _, _, _ = context.shape
+            bs, Ncam, _, W, H = context.shape
 
             context = context.flatten(-2, -1)
-            context = context.flatten(0, 1)
-            global_queries = self.main_queries.parameters().unsqueeze(-1).repeat(bs*Ncam)
-            # img_pos_encode = 
+            context = context.flatten(0, 1).permute(0, 2, 1) # bsNcam, WH, C
+            global_queries = self.main_queries.parameters().unsqueeze(-1).repeat(bs*Ncam) # bsNcam, N, C
 
+            # Find instance unrelated to img position, only value have image position info, since queries are general
             inst_queries, attn_weights = self.img_query_cross_attn(
                 query = global_queries,
                 key = context,
-                value = context
+                value = torch.cat([context, img_local_pos_encode], dim=-1)
             )
-            # attn_weights: bs*Ncam, N_heads, N_queries, HW
-            # inst queries는 이제 특정 instnace의 임베딩에서 이미지에서의 그 특정 instance들이 어떻게 나타나는지에 대한 정보를 가지고 있을 것
+            # inst_queries: bs*Ncam, N_queries, C
+            # attn_weights: bs*Ncam, N_heads, N_queries, WH
 
-            attn_weights = torch.mean(attn_weights, dim=1) # bs*Ncam, N_queries, HW
+            attn_weights = torch.mean(attn_weights, dim=1) # bs*Ncam, N_queries, WH
             _, max_indices = torch.max(attn_weights, dim=-1) # bs*Ncam, N_queries
-            img_h = max_indices // W # bs*Ncam, N_queries
-            img_w = max_indices % W # bs*Ncam, N_queries
-            max_img_coords = torch.cat(img_h.unsqueeze(-1), img_w.unsqueeze(-1), dim = -1) # bs, Ncam, N_queries, 2
+            img_w = max_indices // H # bs*Ncam, N_queries
+            img_h = max_indices % H # bs*Ncam, N_queries
+            max_img_coords = torch.cat([img_w.unsqueeze(-1), img_h.unsqueeze(-1)], dim = -1) # bs*Ncam, N_queries, 2
+            max_img_coords = max_img_coords.reshape(bs, Ncam, -1, 2) # bs, Ncam, N_queries, 2
+            query_global_pos_encode, sph_coords = self.pos_encoder(max_img_coords, *cam_params, mode='Global', custum_input=True, height=H, width=W)
+            query_global_pos_encode = query_global_pos_encode.flatten(0, 1)
+            sph_coords = sph_coords.flatten(1, 2)
+            # query global pos encoder: bsNcam, N_queries, num_freqs*4
+            # sph_coords: bs, Ncam*N_queries, 2 (theta, phi)
 
         if self.with_specific_component('query_self_attn'):
-            inst_queries = self.self_attn(
+            inst_queries, _ = self.query_self_attn(
                 query = inst_queries
+            ) # bsNCam, N_queries, C
+
+        if self.with_specific_component('global_pos_self_attn_L1'):
+            inst_queries, _ = self.global_pos_self_attn_L1(
+                query = inst_queries,
+                key = inst_queries,
+                value = torch.cat([inst_queries, query_global_pos_encode], dim=-1)
+            ) # bsNCam, N_queries, C
+
+        if self.with_specific_component('global_pos_self_attn_L2'):
+            inst_queries, _ = self.global_pos_self_attn_L2(
+                query = inst_queries,
+            ) # bsNCam, N_queries, C
+
+        # if self.with_specific_component('radius_mlp'):
+            _, _, input_c = inst_queries.shape
+            inst_queries = inst_queries.reshape(bs, Ncam, -1, input_c) # bs, Ncam, N_queries, C
+            inst_queries = inst_queries.flatten(1, 2) # bs, Ncam*N_queries, C
+            
+            fc_layer = nn.Sequential(
+                nn.Linear(input_c, input_c*2),
+                nn.GELU(),
+                nn.Linear(input_c*2, 100)
             )
-            # 이미지에서 나타나는 instance들이 어떠한 관계를 가지는가: 목표로 하는건 위치관계를 학습하는 것
+            
+            logits = fc_layer(inst_queries) # bs, Ncam*N_queries, 100
+            r_prob = F.softmax(logits, dim=-1) # bs, Ncam*N_queries, 100
+            
+            r = torch.argmax(r_prob, dim=-1).unsqueeze(-1) * 0.4 # bs, Ncam*N_queries, 1
+            # sph_coords = torch.cat(r_prob, sph_coords, dim=-1) # bs, Ncam*N_quries, 3 (r, theta, phi)
+            theta = sph_coords[..., 0].unsqueeze(-1)
+            phi = sph_coords[..., 1].unsqueeze(-1)
+            
+            ###Spherical to Cartisian idx###
+            grid_config = kwargs['grid_config']
+            
+            x = r * torch.cos(phi) * torch.cos(theta) - grid_config['x'][0]  
+            y = r * torch.cos(phi) * torch.sin(theta) - grid_config['y'][0] 
+            z = r * torch.sin(phi) - grid_config['z'][0] 
+            
+            x = torch.clamp((x / 0.4).long(), 0, 199) # bs, Ncam*N_queries, 1
+            y = torch.clamp((y / 0.4).long(), 0, 199) # bs, Ncam*N_queries, 1
+            z = torch.clamp((z / 0.4).long(), 0, 15) # bs, Ncam*N_queries, 1
+
+            cart_idx = torch.cat([x, y, z], dim=-1) # bs, Ncam*N_queries, 3
+            ################################
+
 
         # #### TODO: context: bs, Ncam, C, H, W // cam_pos_encode: bs, Ncam, C', H, W // Query: bs, Ncam, C', Max_len  차원을 줄인 Camera pos encode를 통해서 pos 정보만 있는 query와의 Q K 연산, 이후 V를 context로 넣어주기. key를 따로 인코딩하자
         # if self.with_specific_component('back_project'):
@@ -427,54 +480,6 @@ class FBOCC(CenterPoint):
         #         cam_params = cam_params,
         #         attn_level = self.num_levels,
         #     )
-
-            C = occ_feat_per_cam.shape[-1]
-            D, W, H, _ = global_pos_encode.shape
-            global_pos_encode = global_pos_encode.unsqueeze(0).repeat(bs, 1, 1, 1, 1) # bs, D, W, H, C
-            
-            occ_feat_per_cam = occ_feat_per_cam.permute(1, 0, 2, 3) # Ncam, bs, Max_Len, C
-            occ_feat = torch.zeros(bs, D, W, H, C).cuda()
-
-            # occ_feat: Bs, D, W, H, C
-            overlap1 = []
-            overlap2 = []
-            for j in range(bs):
-                feat_1, feat_2 = None, None
-                for i, query_per_cam in enumerate(occ_feat_per_cam):
-                    index_query_per_img = indexes[j][i] #(N, 3)
-                    d_indices = index_query_per_img[:, 0]
-                    w_indices = index_query_per_img[:, 1]
-                    h_indices = index_query_per_img[:, 2]
-                    
-                    ####### overlap area check ############
-                    target = occ_feat[j, d_indices, w_indices, h_indices]
-                    object = query_per_cam[j, :len(index_query_per_img)]
-                    mask = target.ne(0).any(dim=-1)
-                    if mask.any():
-                        feat1 = target[mask]
-                        feat2 = object[mask]
-                        if feat_1 is not None and feat_2 is not None:
-                            feat1 = torch.cat([feat_1, feat1], dim=0)
-                            feat2 = torch.cat([feat_2, feat2], dim=0)
-                        feat_1 = feat1
-                        feat_2 = feat2
-                    ######################################
-
-                    occ_feat[j, d_indices, w_indices, h_indices] = query_per_cam[j, :len(index_query_per_img)]
-
-                overlap1.append(feat_1)
-                overlap2.append(feat_2)
-
-
-            # occ_feat = torch.sum(occ_feat, dim=1) # bs, D, W, H, C
-            # for j in range(bs):
-            #     overlap = overlapped[j]
-            #     occ_feat[j, overlap[:,0], overlap[:,1], overlap[:,2]] /= 2
-
-            # return_map['occ_feat'] = occ_feat #bs, D, W, H, C
-            return_map['overlapped_pair'] = [overlap1, overlap2] # (N of overlap, 128)
-            # return_map['occ_feat_per_cam'] = occ_feat_per_cam # Ncam, bs, N, embed_dim
-            # return_map['per_cam_index'] = indexes # [bs][Ncam][N][3]
 
         # if self.with_specific_component('voxel_self_attn'):
         #     occ_feat = occ_feat.flatten(1, 3) # bs, DWH, C

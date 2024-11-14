@@ -112,8 +112,8 @@ class FBOCC(CenterPoint):
         # self.fc0 = nn.Linear(80, 1, device='cuda') if n_queries else None
         # self.fc1 = nn.Linear(256, 128, device='cuda') if keypoint else None
         # self.fc2 = nn.Linear(128, 80, device='cuda') if keypoint else None
-        self.conv1 = nn.Conv2d(in_channels=128, out_channels=80, kernel_size=1, stride=1)
-        self.conv2 = nn.Conv2d(in_channels=80, out_channels=8, kernel_size=1, stride=1)
+        self.conv1 = nn.Conv2d(in_channels=256, out_channels=128, kernel_size=1, stride=1)
+        self.conv2 = nn.Conv2d(in_channels=256, out_channels=8, kernel_size=1, stride=1)
         self.bn1 = nn.BatchNorm3d(80)
         self.bn2 = nn.BatchNorm3d(8)
         # #######For old config##############   
@@ -387,7 +387,7 @@ class FBOCC(CenterPoint):
         if self.with_specific_component('depth_net'):
             # t=time.time()
             mlp_input = self.depth_net.get_mlp_input(*cam_params)
-            context, depth = self.depth_net(context, mlp_input)
+            context, depth = self.depth_net(context, mlp_input) # Depth: Bs, N, 80, 16, 44
             return_map['depth'] = depth
             return_map['context'] = context
         else:
@@ -700,7 +700,6 @@ class FBOCC(CenterPoint):
                 pred_occupancy_category = pred_occupancy
             else:
                 pred_occupancy_category = pred_occupancy.argmax(-1)
-                pred_occupancy_category = pred_occupancy[..., 1:]
             t=time.time()
 
             # # do not change the order

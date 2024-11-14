@@ -97,9 +97,11 @@ numC_Trans=80
 back_dim_=256
 fcn_dim_ = 512
 _dim_ = 128
+pos_encode_freq = 8
+
 _pos_dim_ = 40
 _ffn_dim_ = numC_Trans * 4
-_num_heads_ = 8
+_num_heads_ = 6
 _num_levels_= 2
 _num_queries_=100
 
@@ -122,6 +124,7 @@ model = dict(
     single_bev_num_channels=numC_Trans,
     readd=True,
     embed_dim=_dim_,
+    N_global_queries=100,
     attn_level=_num_levels_,
     grid_config = grid_config,
 
@@ -148,27 +151,42 @@ model = dict(
         out_ids=[0]
     ),
 
-    # cam_pos_encoder=dict(
-    #     type='CamPosEncoder',
-    #     data_config = data_config,
-    #     grid_config = grid_config,
-    #     num_freqs = 10,
-    # ),
-
-    # cam_feat_encoder=dict(
-    #     type='CamFeatEncoder',
-    #     in_channel=back_dim_+ 40, # Must be _dim_ + 4*num_freqs in cam pos encoder
-    #     out_channel=_dim_,
-    # ),
+    pos_encoder=dict(
+        type='CamPosEncoder',
+        data_config = data_config,
+        num_freqs = pos_encode_freq,
+    ),
 
     img_query_cross_attn=dict(
+        type='TransformerLayer',
+        embed_dims=_dim_,
+        out_dims=_dim_+(pos_encode_freq*4),
+        num_heads=_num_heads_,
+        mlp_ratio=2
+    ),
+
+    query_self_attn=dict(
         type='TransformerLayer',
         embed_dims=_dim_,
         num_heads=_num_heads_,
         mlp_ratio=2
     ),
 
-    # voxel_self_attn = dict(
+    global_pos_self_attn_L1=dict(
+        type='TransformerLayer',
+        embed_dims=_dim_,
+        out_dims=_dim_+(pos_encode_freq*4),
+        num_heads=_num_heads_,
+        mlp_ratio=2
+    ),
+
+    global_pos_self_attn_L2=dict(
+        type='TransformerLayer',
+        embed_dims=_dim_,
+        num_heads=_num_heads_,
+        mlp_ratio=2
+    ),
+    
     #     type='TransformerLayer',
     #     embed_dims=_dim_,
     #     num_heads=_num_heads_,

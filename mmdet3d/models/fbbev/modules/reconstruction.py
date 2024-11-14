@@ -14,29 +14,22 @@ import math
 class SphericalPositionalEncodingWithView(torch.nn.Module):
     def __init__(self, max_radius=40, num_freqs=8):
         super(SphericalPositionalEncodingWithView, self).__init__()
-        self.num_freqs = num_freqs
         self.freq_bands = 2.0 ** torch.linspace(0, num_freqs - 1, num_freqs).cuda()
     
-    def forward(self, coords, img_encode=False, encode_theta=False, theta_only=False):
+    def forward(self, coords): # img_encode=False, encode_theta=False, theta_only=False):
         """
         Args:
-            coords: Tensor of shape (N, 3) representing (r, theta, phi) coordinates in 3D space.
+            coords: Tensor of shape (bs, Ncam, Length, 2) representing (theta, phi) coordinates in 3D space.
 
         Returns:
-            pos_enc: (N, num_freqs * 6)
+            pos_enc: (bs, Ncam, Length, num_freqs*4) # num_freq*2 for theta and concat num_freq*2 for phi
         """
+        # bs, Ncam, L, 2
         x_list = []
         for i in range(coords.shape[-1]):
             x = coords[..., i]
-            x_min, x_max = x.min(), x.max()
-            x = (x - x_min) / (x_max - x_min + 1e-8)
-
-            if img_encode:
-                x = torch.cat([torch.sin(self.freq_bands[None, None, :] * x[..., None]),
-                                torch.cos(self.freq_bands[None, None, :] * x[..., None])], dim=-1)
-            else:
-                x = torch.cat([torch.sin(self.freq_bands[None, :] * x[:, None]),
-                                torch.cos(self.freq_bands[None, :] * x[:, None])], dim=-1)
+            x = torch.cat([torch.sin(self.freq_bands[None, None, None, :] * x[..., None]),
+                            torch.cos(self.freq_bands[None, None, None, :] * x[..., None])], dim=-1)
             x_list.append(x)
         
         pos_enc = torch.cat(x_list, dim=-1).cuda()
@@ -575,13 +568,13 @@ class CamFeatEncoder(nn.Module):
 
 @NECKS.register_module()
 class CamPosEncoder(nn.Module):
-    def __init__(self, data_config = None, grid_config = None, num_freqs = None,):
+    def __init__(self, data_config = None, num_freqs = None, custum_input=False):
         super(CamPosEncoder, self).__init__()
-        self.original_dim=data_config['input_size']
-        self.cam_theta = grid_config['Cam_Setting'] 
+        self.original_dim=data_config['src_size']
+        self.input_dim=data_config['input_size']
         self.encoder = SphericalPositionalEncodingWithView(num_freqs=num_freqs)
         
-    def img_to_spherical(self, img_grid, intrinsic, rotation, trans, post_rotation, post_trans, bda, cam_theta):
+    def img_to_spherical(self, img_grid, intrinsic, rotation, trans, post_rotation, post_trans, bda, mode=None):
         """
         Args:
             u, v: Pixel coordinates in the image (bs, ncam, H, W)
@@ -603,41 +596,60 @@ class CamPosEncoder(nn.Module):
         img_coords = torch.cat([img_grid, ones], dim=-1)  # Shape (bs, ncam, HW, 3)
 
         img_coords -= post_trans.view(bs, Ncam, 1, 3)
-        img_coords = torch.inverse(post_rotation).view(bs, Ncam, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
+        img_coords = post_rotation.inverse().view(bs, Ncam, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
 
         img_coords = intrinsic.inverse().view(bs, Ncam, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
+        
+        ### Ego Coordinate (Global)
+        if mode == 'Global':
+            img_coords = rotation.view(bs, Ncam, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
+            img_coords += trans.view(bs, Ncam, 1, 3)
 
-        img_coords = rotation.view(bs, Ncam, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
-        # img_coords += trans.view(bs, Ncam, 1, 3)
+            final_coords = bda.view(bs, 1, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
 
-        final_coords = bda.view(bs, 1, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
+            D, W, H = final_coords[..., 0], final_coords[..., 1], final_coords[..., 2]
 
-        D, W, H = final_coords[..., 0], final_coords[..., 1], final_coords[..., 2]
+        ### Camera Coordinate (Local)
+        if mode == 'Local':
+            W, H, D = -img_coords[..., 0], -img_coords[..., 1], img_coords[..., 2]
+
         theta = torch.atan2(W, D)  # Shape (bs, ncam, H*W)
         phi = torch.atan2(H, torch.sqrt(D**2 + W**2))  # Shape (bs, ncam, H*W)
 
         return theta, phi
 
-    def forward(self, img_context, rot, tran, intrin, post_rot, post_tran, bda):
-        bs, Ncam, _, H, W = img_context.shape
-        dwn_ratio = self.original_dim[0] // H
-        assert (self.original_dim[0] // H) == (self.original_dim[1] // W)
+    def forward(self, img_context, rot, tran, intrin, post_rot, post_tran, bda, mode, custum_input=False, height=None, width=None):
+        if custum_input:
+            img_grid=img_context # bs, Ncam, N_queries, 2
+            H = height
+            W = width
 
-        u = torch.linspace(0, W - 1, W).to(img_context.device)
-        v = torch.linspace(0, H - 1, H).to(img_context.device)
+        else:
+            bs, Ncam, _, W, H = img_context.shape
+            # dwn_ratio = self.input_dim[0] // H
+            assert (self.input_dim[0] // W) == (self.input_dim[1] // H)
 
-        u, v = torch.meshgrid(u, v, indexing='ij')
-        img_grid = torch.stack([v, u], dim=-1).flatten(0, 1) * dwn_ratio
- 
-        img_grid = img_grid[None, None, :].expand(bs, Ncam, H*W, 2)
-        theta, phi = self.img_to_spherical(img_grid, intrin, rot, tran, post_rot, post_tran, bda, self.cam_theta)
-        target = torch.cat([theta.unsqueeze(-1), phi.unsqueeze(-1)], dim=-1) # bs, Ncam, H*W, 2
+            u = torch.linspace(0, W - 1, W).to(img_context.device)
+            v = torch.linspace(0, H - 1, H).to(img_context.device)
+
+            u, v = torch.meshgrid(u, v, indexing='ij')
+            img_grid = torch.stack([u, v], dim=-1).flatten(0, 1)
+
+        img_grid[..., 0] *= (self.original_dim[1]/W)
+        img_grid[..., 1] *= (self.original_dim[0]/H)
+
+        img_grid = img_grid[None, None, :].expand(bs, Ncam, W*H, 2)
+        theta, phi = self.img_to_spherical(img_grid, intrin, rot, tran, post_rot, post_tran, bda, mode)
+        sph_coord = torch.cat([theta.unsqueeze(-1), phi.unsqueeze(-1)], dim=-1) # bs, Ncam, WH, 2
+
+        pos_encode = self.encoder(sph_coord) # Encoded Result: bs, Ncam, L, num_freqs*4
+
+        # target_list = []
+        # for i in range(bs):
+        #     target_per_batch = self.encoder(target[i], img_encode=True)
+        #     target_list.append(target_per_batch.unsqueeze(0))
+        # target = torch.cat(target_list, dim=0).reshape(bs, Ncam, H, W, -1)
+        if custum_input:
+            return pos_encode, sph_coord 
         
-        target_list = []
-        for i in range(bs):
-            target_per_batch = self.encoder(target[i], img_encode=True)
-            target_list.append(target_per_batch.unsqueeze(0))
-            
-        target = torch.cat(target_list, dim=0).reshape(bs, Ncam, H, W, -1)
-
-        return target
+        return pos_encode

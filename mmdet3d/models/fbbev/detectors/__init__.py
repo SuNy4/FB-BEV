@@ -1,2 +1,2 @@
 
-from .fbocc import FBOCC
+from .sparse_pos_encode import FBOCC

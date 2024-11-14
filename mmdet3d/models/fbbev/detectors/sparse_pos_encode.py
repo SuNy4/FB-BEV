@@ -53,6 +53,7 @@ class FBOCC(CenterPoint):
 
                  # Fast Instance Occ
                  cam_pos_encoder = None,
+                 cam_feat_encoder = None,
                  back_project=None,
                  voxel_self_attn=None,
                  geometry_head=None,
@@ -103,17 +104,15 @@ class FBOCC(CenterPoint):
         self.img_bev_encoder_neck = builder.build_neck(img_bev_encoder_neck) if img_bev_encoder_neck else None
 
         #FIOcc init
+        #self.object_embedd = nn.Embedding()
         self.cam_pos_encoder = builder.build_neck(cam_pos_encoder) if cam_pos_encoder else None
+        self.cam_feat_encoder = builder.build_neck(cam_feat_encoder) if cam_feat_encoder else None
         self.back_project = builder.build_neck(back_project) if back_project else None
         self.bev_fcn_encoder = builder.build_neck(bev_fcn_encoder) if bev_fcn_encoder else None
         self.voxel_self_attn = builder.build_neck(voxel_self_attn) if voxel_self_attn else None
         self.geometry_head = builder.build_neck(geometry_head) if geometry_head else None
         self.inst_lvl_self_attn = builder.build_neck(inst_lvl_self_attn) if back_project else None
-        self.conv1 = nn.Conv2d(in_channels=256, out_channels=128, kernel_size=1, stride=1) if bev_fcn_encoder else None
-        self.conv2 = nn.Conv2d(in_channels=128, out_channels=8, kernel_size=1, stride=1) if bev_fcn_encoder else None
-        self.bn1 = nn.BatchNorm3d(128) if bev_fcn_encoder else None
-        self.bn2 = nn.BatchNorm3d(8) if bev_fcn_encoder else None
-        self.gelu = nn.GELU() if bev_fcn_encoder else None
+        # self.main_queries = nn.Embedding(N, 256)
 
         # FC layer
 
@@ -353,21 +352,30 @@ class FBOCC(CenterPoint):
         return feats_to_return.clone()
 
 #######################################################################################################
+    ### OVerall Flow: 2D feature encode with global pos info -> 2D 3D deformable attention(Sim Loss) -> 3D deformable self attention -> Occupied MLP head(CE loss) -> Sparsified voxels(large norm self attention) -> MLP head -> Combine Map
+    
+    ### TODO: Global pos encode to img feature
+    ### TODO_append: Sparse Conv3d => instance level self attention으로 일단 대체(Temporal을 위해서 넘길만한 무언가를 빼줘야됨)
+    ### TODO: Combine in Head and Overlap area loss
+
     def extract_img_bev_feat(self, img, img_metas, **kwargs):
         """Extract features of images."""
 
         return_map = {}
 
         context = self.image_encoder(img[0]) # Bs, Ncam, C, H, W
+        print(context.shape)
 
         cam_params = img[1:7]
         #rot, tran, intrin, post_rot, post_tran, bda = *cam_params
 
         if self.with_specific_component('cam_pos_encoder'):
-            cam_pos = self.cam_pos_encoder(context, *cam_params)
+            cam_pos = self.cam_pos_encoder(context, *cam_params, mode='Global') # Bs, Ncam, H, W, encoded_dim
+            cam_pos = cam_pos.permute(0, 1, 4, 2, 3)
 
         if self.with_specific_component('cam_feat_encoder'):
-            cam_encode = self.cam_encoder(context)
+            context = torch.cat([context, cam_pos], dim=2)
+            context = self.cam_feat_encoder(context)
 
         #### TODO: context: bs, Ncam, C, H, W // cam_pos_encode: bs, Ncam, C', H, W // Query: bs, Ncam, C', Max_len  차원을 줄인 Camera pos encode를 통해서 pos 정보만 있는 query와의 Q K 연산, 이후 V를 context로 넣어주기. key를 따로 인코딩하자
         if self.with_specific_component('back_project'):
@@ -389,69 +397,196 @@ class FBOCC(CenterPoint):
             # occ_feat_per_cam: bs, Ncam, Max_Len, C
             # indexes: [bs][ncam][N][3] List
             # overlapped: [bs][전체 overlapped 수][3]
-            # global_pos_per_cam: bs, Ncam, Max_Len, C
+            # global_pos_per_cam: bs, Ncam, Max_Len, C'
             # occ_feat = bs, Ncam, D, W, H, C (Zeros)
+            # Global Pos Encode: D, W, H, 4 cartisian
 
-            occ_feat = torch.zeros(bs, Ncam, 100, 100, 8, 256).cuda()
-            occ_feat_per_cam, indexes, overlapped, global_pos_encode = self.back_project(
+            occ_feat_per_cam, indexes, global_pos_encode = self.back_project(
                 value = context,
                 view_transform = True,
                 spatial_shapes = spatial_shapes,
                 level_start_index = level_start_index,
                 cam_params = cam_params,
+                attn_level = self.num_levels,
             )
 
-        # if self.with_specific_component('voxel_self_attn'):
-            occ_feat_per_cam = occ_feat_per_cam.flatten(0, 1)
-            # global_pos_per_cam = global_pos_per_cam.flatten(0, 1)
-
-            # for _ in range(self.num_levels):
-            #     occ_feat_per_cam = self.voxel_self_attn(
-            #         query=occ_feat_per_cam,
-            #         query_pos=global_pos_per_cam
-            #         )
+            C = occ_feat_per_cam.shape[-1]
+            D, W, H, _ = global_pos_encode.shape
+            global_pos_encode = global_pos_encode.unsqueeze(0).repeat(bs, 1, 1, 1, 1) # bs, D, W, H, C
             
-            occ_feat_per_cam = occ_feat_per_cam.reshape(bs, Ncam, -1, embed_dim).permute(1, 0, 2, 3) # Ncam, bs, Max_Len, C
-            overlap_feat = []
+            occ_feat_per_cam = occ_feat_per_cam.permute(1, 0, 2, 3) # Ncam, bs, Max_Len, C
+            occ_feat = torch.zeros(bs, D, W, H, C).cuda()
 
+            # occ_feat: Bs, D, W, H, C
+            overlap1 = []
+            overlap2 = []
             for j in range(bs):
-                overlap = overlapped[j]
+                feat_1, feat_2 = None, None
                 for i, query_per_cam in enumerate(occ_feat_per_cam):
                     index_query_per_img = indexes[j][i] #(N, 3)
                     d_indices = index_query_per_img[:, 0]
                     w_indices = index_query_per_img[:, 1]
                     h_indices = index_query_per_img[:, 2]
-                    occ_feat[j, i, d_indices, w_indices, h_indices] = query_per_cam[j, :len(index_query_per_img)]
-                over_feat = occ_feat[j, :, overlap[:,0], overlap[:,1], overlap[:,2]]
-                overlap_feat.append(over_feat)
+                    
+                    ####### overlap area check ############
+                    target = occ_feat[j, d_indices, w_indices, h_indices]
+                    object = query_per_cam[j, :len(index_query_per_img)]
+                    mask = target.ne(0).any(dim=-1)
+                    if mask.any():
+                        feat1 = target[mask]
+                        feat2 = object[mask]
+                        if feat_1 is not None and feat_2 is not None:
+                            feat1 = torch.cat([feat_1, feat1], dim=0)
+                            feat2 = torch.cat([feat_2, feat2], dim=0)
+                        feat_1 = feat1
+                        feat_2 = feat2
+                    ######################################
 
-            occ_feat = torch.sum(occ_feat, dim=1) # bs, D, W, H, C
+                    occ_feat[j, d_indices, w_indices, h_indices] = query_per_cam[j, :len(index_query_per_img)]
+
+                overlap1.append(feat_1)
+                overlap2.append(feat_2)
+
+
+            # occ_feat = torch.sum(occ_feat, dim=1) # bs, D, W, H, C
+            # for j in range(bs):
+            #     overlap = overlapped[j]
+            #     occ_feat[j, overlap[:,0], overlap[:,1], overlap[:,2]] /= 2
+
+            # return_map['occ_feat'] = occ_feat #bs, D, W, H, C
+            return_map['overlapped_pair'] = [overlap1, overlap2] # (N of overlap, 128)
+            # return_map['occ_feat_per_cam'] = occ_feat_per_cam # Ncam, bs, N, embed_dim
+            # return_map['per_cam_index'] = indexes # [bs][Ncam][N][3]
+
+        # if self.with_specific_component('voxel_self_attn'):
+        #     occ_feat = occ_feat.flatten(1, 3) # bs, DWH, C
+        #     global_pos_encode = global_pos_encode.flatten(1, 3) # bs, DWH, C
+
+        #     x = torch.arange(D).view(-1, 1, 1).expand(D, W, H)
+        #     y = torch.arange(W).view(1, -1, 1).expand(D, W, H)
+        #     z = torch.arange(H).view(1, 1, -1).expand(D, W, H)
+        #     coords = torch.stack([x, y, z], dim=-1).flatten(0,2).unsqueeze(0).repeat(bs, 1, 1).cuda() # bs, DWH, 3
             
-            for j in range(bs):
-                overlap = overlapped[j]
-                occ_feat[j, overlap[:,0], overlap[:,1], overlap[:,2]] /= 2
+        #     spatial_shapes = []
+        #     spatial_shape = (D, W, H)
+        #     spatial_shapes.append(spatial_shape)
 
-            return_map['occ_feat'] = occ_feat #bs, D, W, H, C
-            return_map['overlap_feat_per_batch'] = overlap_feat # [bs][Ncam, # of overlap, C]
-        
-        if self.with_specific_component('bev_fcn_encoder'):
-            # bev_feat.shape = bs, c, D, W, H => bs, c*H, D, W => bs, c_out, D, W
-            bs, D, W, H, C = occ_feat.shape
-            occ_feat = occ_feat.flatten(3, 4).permute(0, 3, 1, 2) # bs, C*H, D, W
-            occ_feat = self.bev_fcn_encoder(occ_feat) # bs, C', D, W
+        #     spatial_shapes = torch.as_tensor(
+        #         spatial_shapes, dtype=torch.long, device=context.device)
+        #     level_start_index = torch.cat((spatial_shapes.new_zeros(
+        #         (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
 
-            bev_h = self.gelu(self.bn1(self.conv1(occ_feat))) # bs, C', D, W
-            bev_h = self.gelu(self.bn2(self.conv2(bev_h))).permute(0, 2, 3, 1) # bs, H, D, W => bs, D, W, H
-            prob = bev_h.sigmoid()
-            bev_h = (prob > 0.7)
+        #     occ_feat = self.voxel_self_attn(
+        #             query = occ_feat,
+        #             query_pos = global_pos_encode,
+        #             value = occ_feat,
+        #             ref_pts = coords,
+        #             occ_value = True,
+        #             spatial_shapes = spatial_shapes,
+        #             level_start_index = level_start_index,
+        #         )
             
-            occ_feat = occ_feat.unsqueeze(-1) * bev_h.unsqueeze(1) # bs, C, D, W, H
-            occ_feat = occ_feat.permute(0, 2, 3, 4, 1)
+        #     occ_feat = occ_feat.reshape(bs, D, W, H, C)
+        #     global_pos_encode = global_pos_encode.reshape(bs, D, W, H, C)
 
         if self.with_specific_component('geometry_head'):
+            prob, _ = self.geometry_head(occ_feat) # bs, D, W, H: boolean tensor
+            return_map['pred_cam_mask'] = prob
+            ##############################################################
+            occ_feat *= prob.unsqueeze(-1)
+            # n=50
 
-            prob, bev_h = self.geometry_head(occ_feat) # bs, D, W, H: boolean tensor
-            return_map['geom'] = prob
+            # occ_feat = occ_feat.flatten(1,3)
+            # global_pos_encode = global_pos_encode.flatten(1,3)
+            # selected_feats = []
+            # selected_pos = []
+
+            # for b in range(bs):
+            #     norms = torch.norm(occ_feat[b], dim=-1)
+            #     _, top_indices = torch.topk(norms, n)
+
+            #     voxel_feat = occ_feat[b, top_indices]
+            #     voxel_pos = global_pos_encode[b, top_indices]
+
+            #     selected_feats.append(voxel_feat)
+            #     selected_pos.append(voxel_pos)
+            
+            # selected_feats = torch.stack(selected_feats)  # (bs, 100, C)
+            # selected_pos = torch.stack(selected_pos)
+
+            # for _ in range(self.num_levels):
+            #     occ_feat = self.voxel_self_attn(
+            #         query = occ_feat,
+            #         query_pos = global_pos_encode,
+            #         key = selected_feats,
+            #         key_pos = selected_pos,
+            #         value = selected_feats,
+            #     )
+            
+            # occ_feat = occ_feat.reshape(bs, D, W, H, C)
+            # global_pos_encode = global_pos_encode.reshape(bs, D, W, H, C)
+            # prob, geom = self.geometry_head(occ_feat) # bs, D, W, H: boolean tensor
+            # return_map['geom'] = prob
+
+            # occ_index = [] # [bs][N][3] occupied voxel indexes
+            # max_len = 0
+                        
+            # for i, per_batch_geom in enumerate(geom):
+            #     index_per_batch = per_batch_geom.nonzero().squeeze(-1)
+            #     occ_index.append(index_per_batch)
+            #     max_len = max(max_len, len(index_per_batch))
+
+            # sparse_voxel = torch.zeros([
+            #     bs, max_len, embed_dim
+            # ]).cuda()
+
+            # sparse_pos_enc = torch.zeros([
+            #     bs, max_len, embed_dim
+            # ]).cuda()
+
+            # for i, index in enumerate(occ_index):   
+            #     d_indices = index[:, 0]
+            #     w_indices = index[:, 1]
+            #     h_indices = index[:, 2]
+            #     sparse_voxel[i, :len(index)] = occ_feat[i, d_indices, w_indices, h_indices]
+            #     sparse_pos_enc[i, :len(index)] = global_pos_encode[i, d_indices, w_indices, h_indices]
+            ########################################################################
+            # occ_index = [] # [bs][N][3] occupied voxel indexes
+            # max_len = 0
+            
+            # for i, per_batch_geom in enumerate(geom):
+            #     index_per_batch = per_batch_geom.nonzero().squeeze(-1)
+            #     occ_index.append(index_per_batch)
+            #     max_len = max(max_len, len(index_per_batch))
+
+            # sparse_voxel = torch.zeros([
+            #     bs, max_len, embed_dim
+            # ]).cuda()
+
+            # sparse_pos_enc = torch.zeros([
+            #     bs, max_len, embed_dim
+            # ]).cuda()
+
+            # for i, index in enumerate(occ_index):   
+            #     d_indices = index[:, 0]
+            #     w_indices = index[:, 1]
+            #     h_indices = index[:, 2]
+            #     sparse_voxel[i, :len(index)] = occ_feat[i, d_indices, w_indices, h_indices]
+            #     sparse_pos_enc[i, :len(index)] = global_pos_encode[i, d_indices, w_indices, h_indices]
+
+        if self.with_specific_component('bev_fcn_encoder'):
+            C_ = global_pos_encode.shape[-1]
+            occ_feat = torch.cat([occ_feat, global_pos_encode[..., (C_-32):]], dim=-1)  # bs, D, W, H, C+C'
+  
+            # occ_feat.shape = bs, D, W, H, C => bs, H*C, D, W => bs, c_out, D, W
+            occ_feat = occ_feat.flatten(3, 4).permute(0, 3, 1, 2) # bs, H*C, D, W
+            occ_feat, bev_h = self.bev_fcn_encoder(occ_feat) # bs, C', D, W // bs, D, W, H
+
+            return_map['geom'] = bev_h
+            
+            bev_h = (bev_h > 0.5)
+            occ_feat = occ_feat.unsqueeze(-1) * bev_h.unsqueeze(1)# bs, C, D, W, H
+            occ_feat = occ_feat.permute(0, 2, 3, 4, 1)
 
             occ_index = [] # [bs][N][3] occupied voxel indexes
             max_len = 0
@@ -469,15 +604,14 @@ class FBOCC(CenterPoint):
                 bs, max_len, embed_dim
             ]).cuda()
 
-            for i in range(bs):   
-                index = occ_index[i]
+            for i, index in enumerate(occ_index):   
                 d_indices = index[:, 0]
                 w_indices = index[:, 1]
                 h_indices = index[:, 2]
                 sparse_voxel[i, :len(index)] = occ_feat[i, d_indices, w_indices, h_indices]
-                sparse_pos_enc[i, :len(index)] = global_pos_encode[d_indices, w_indices, h_indices]
+                sparse_pos_enc[i, :len(index)] = global_pos_encode[i, d_indices, w_indices, h_indices]
 
-        # if self.with_specific_component('sparse_fcn_encoder'):
+        # if self.with_specific_component('sparse_conv_encoder'):
         #     # occ_feat = bs, D, W, H, C => bs, D, W, H*C => bs, H*C, D, W
         #     # SparseFCN: bs, c*H, D, W => bs, c, D, W = bs, c_out, D, W
         #     bs, D, W, H, C = occ_feat.shape
@@ -518,7 +652,7 @@ class FBOCC(CenterPoint):
             selected_feats = torch.stack(selected_feats)  # (bs, 100, C)
             selected_pos = torch.stack(selected_pos)
 
-            ### Clusturing Method
+            ###################### Clusturing Method ##################
             # n_clusters = 100
             # for b in range(bs):
             #     batch_feature = sparse_voxel[b].detach() # (N, C)
@@ -548,6 +682,7 @@ class FBOCC(CenterPoint):
 
             # selected_feats = torch.stack(selected_feats)  # (bs, 100, C)
             # selected_pos = torch.stack(selected_pos)
+            ##################################################
 
             for _ in range(self.num_levels):
                 sparse_voxel = self.inst_lvl_self_attn(
@@ -558,30 +693,35 @@ class FBOCC(CenterPoint):
                     value = selected_feats,
                 )
 
-            bs, D, W, H, C = occ_feat.shape
-            output = torch.zeros(
-                [bs, D, W, H, C]
-            ).cuda()
+            ### sparse_voxel: Bs, N, C
+            ### occ_index: [Bs][N][3]
 
-            for i in range(bs):   
-                index = occ_index[i]
-                d_indices = index[:, 0]
-                w_indices = index[:, 1]
-                h_indices = index[:, 2]
-                output[i, d_indices, w_indices, h_indices] = sparse_voxel[i, :len(index)] # bs, D, W, H, C
+            # bs, D, W, H, C = occ_feat.shape
+            # output = torch.zeros(
+            #     [bs, D, W, H, C]
+            # ).cuda()
 
-            #for 50x50x4 to 100x100x8
-            # bev_feat = self.upsample3d(bev_feat)
+            # for i in range(bs):   
+            #     index = occ_index[i]
+            #     d_indices = index[:, 0]
+            #     w_indices = index[:, 1]
+            #     h_indices = index[:, 2]
+            #     output[i, d_indices, w_indices, h_indices] = sparse_voxel[i, :len(index)] # bs, D, W, H, C
 
-            output = [output.permute(0, 4, 1, 2, 3)] # bs, C, D, W, H
+            # #for 50x50x4 to 100x100x8
+            # # bev_feat = self.upsample3d(bev_feat)
 
+            # output = [output.permute(0, 4, 1, 2, 3)] # bs, C, D, W, H
+
+            return_map['sparse_idx']= occ_index
+            return_map['sparse_feat'] = sparse_voxel
 #######################################################################################################
 
         # Fuse History
         # bev_feat = self.fuse_history(bev_feat, img_metas, img[6])
         
         #bev_feat = self.bev_encoder(bev_feat)
-        return_map['img_bev_feat'] = output
+        # return_map['img_bev_feat'] = output
 
         return return_map
 
@@ -657,7 +797,7 @@ class FBOCC(CenterPoint):
             losses.update(losses_pts)
             
         if self.with_specific_component('occupancy_head'):
-            losses_occupancy = self.occupancy_head.forward_train(results['img_bev_feat'], results=results, gt_occupancy=kwargs['gt_occupancy'], gt_occupancy_flow=gt_occupancy_flow, sparse=True)
+            losses_occupancy = self.occupancy_head.forward_train(results['sparse_feat'], results=results, gt_occupancy=kwargs['gt_occupancy'], cam_mask=kwargs['cam_visible_mask'], gt_occupancy_flow=gt_occupancy_flow, sparse=True)
             losses.update(losses_occupancy)
 
         if self.with_specific_component('frpn'):
@@ -745,7 +885,7 @@ class FBOCC(CenterPoint):
 
         if self.with_specific_component('occupancy_head'):
             # t=time.time()
-            pred_occupancy = self.occupancy_head.forward_sparse(results['img_bev_feat'], results=results, **kwargs)['output_voxels'][0]
+            pred_occupancy = self.occupancy_head.forward_sparse(results['sparse_feat'], results['sparse_idx'], **kwargs)['output_voxels'][0]
             # print(f"\nHead time:{time.time()-t}")
 
             pred_occupancy = pred_occupancy.permute(0, 2, 3, 4, 1)[0]

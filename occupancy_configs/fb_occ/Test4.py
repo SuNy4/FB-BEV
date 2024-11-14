@@ -6,8 +6,8 @@
 
 
 # we follow the online training settings  from solofusion
-num_gpus = 2
-samples_per_gpu = 24
+num_gpus = 3
+samples_per_gpu = 16
 num_iters_per_epoch = int(28130 // (num_gpus * samples_per_gpu) * 4.554)
 num_epochs = 20
 checkpoint_epoch_interval = 1
@@ -293,7 +293,7 @@ share_data_config = dict(
 test_data_config = dict(
     pipeline=test_pipeline,
     sequences_split_num=test_sequences_split_num,
-    ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl')# 'bevdetv2-nuscenes_infos_val.pkl')
+    ann_file=data_root + 'single_scene_overfit.pkl')# 'bevdetv2-nuscenes_infos_val.pkl')
 
 data = dict(
     samples_per_gpu=samples_per_gpu,
@@ -302,7 +302,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl',#'bevdetv2-nuscenes_infos_train.pkl'
+        ann_file=data_root + 'single_scene_overfit.pkl',#'bevdetv2-nuscenes_infos_train.pkl'
         pipeline=train_pipeline,
         classes=class_names,
         test_mode=False,
@@ -356,5 +356,5 @@ custom_hooks = [
         temporal_start_iter=num_iters_per_epoch *2,
     ),
 ]
-load_from = './ckpts/depthnet_pretrained.pth'#'/home/sungjin/codes/FB-BEV/work_dirs/FIOcc/iter_800.pth'
+load_from = './ckpts/depthnet_pretrained.pth' #/home/sungjin/codes/FB-BEV/work_dirs/FIOcc/iter_800.pth'
 #fp16 = dict(loss_scale='dynamic')

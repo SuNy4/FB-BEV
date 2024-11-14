@@ -7,8 +7,8 @@
 
 # we follow the online training settings  from solofusion
 num_gpus = 2
-samples_per_gpu = 5
-num_iters_per_epoch = int(120 // (num_gpus * samples_per_gpu) * 4.554) # single_scene: 120, whole_scene: 28130, half_scene: 13979
+samples_per_gpu = 3
+num_iters_per_epoch = int(28130 // (num_gpus * samples_per_gpu) * 4.554) # single_scene: 120, whole_scene: 28130, half_scene: 13979
 num_epochs = 20
 checkpoint_epoch_interval = 1
 use_custom_eval_hook = True
@@ -70,7 +70,7 @@ bda_aug_conf = dict(
     flip_dx_ratio=0,#0.5,
     flip_dy_ratio=0)#0.5)
 
-use_checkpoint = True
+use_checkpoint = False
 sync_bn = True
 
 
@@ -95,10 +95,11 @@ bev_w_ = 100
 occ_h = 8
 numC_Trans=80
 back_dim_=256
-_dim_ = 256
+fcn_dim_ = 512
+_dim_ = 128
 _pos_dim_ = 40
 _ffn_dim_ = numC_Trans * 4
-_num_heads_ = 4
+_num_heads_ = 8
 _num_levels_= 2
 _num_queries_=100
 
@@ -111,7 +112,7 @@ occ_size = [200, 200, 16]
 voxel_out_indices = (0, 1, 2)
 voxel_out_channel = 256
 voxel_channels = [64, 64*2, 64*4]
-freeze_depthnet_components = True
+freeze_depthnet_components = False
 model = dict(
     type='FBOCC',
     use_depth_supervision=False,
@@ -140,17 +141,23 @@ model = dict(
     img_neck=dict(
         type='CustomFPN',
         in_channels=[1024, 2048],
-        out_channels=back_dim_,
+        out_channels=_dim_,#_dim_, #back_dim_,
         num_outs=1,
         start_level=0,
         with_cp=use_checkpoint,
         out_ids=[0]
     ),
 
-    # cam_pos_encoder=dict(
-    #     type='CamPosEncoder',
-    #     data_config = data_config,
-    #     grid_config = grid_config,
+    cam_pos_encoder=dict(
+        type='CamPosEncoder',
+        data_config = data_config,
+        num_freqs = 10,
+    ),
+
+    # cam_feat_encoder=dict(
+    #     type='CamFeatEncoder',
+    #     in_channel=back_dim_+ 40, # Must be _dim_ + 4*num_freqs in cam pos encoder
+    #     out_channel=_dim_,
     # ),
 
     back_project=dict(
@@ -159,21 +166,41 @@ model = dict(
         mlp_ratio=2,
         num_heads=_num_heads_,
         num_levels=1,
-        num_points=4,
+        num_points=8,
         grid_config=grid_config,
         data_config=data_config,
     ),
 
-    # bev_fcn_encoder=dict(
-    #     type='BEV2DFCN',
-    #     flatten_height=True,
-    #     height=occ_h,
-    #     in_channels = _dim_,
-    #     out_channels= _dim_
-    # ),
-
     # voxel_self_attn = dict(
     #     type='TransformerLayer',
+    #     embed_dims=_dim_,
+    #     num_heads=_num_heads_,
+    #     mlp_ratio=2
+    # ),
+
+    # voxel_self_attn=dict(
+    #     type='PosDeformableTransformerLayer',
+    #     embed_dims=_dim_,
+    #     mlp_ratio=2,
+    #     num_heads=_num_heads_,
+    #     num_levels=1,
+    #     num_points=5,
+    #     attn_layer='DeformableSqueezeAttention',
+    #     grid_config=grid_config,
+    #     data_config=data_config,
+    # ),
+
+    bev_fcn_encoder=dict(
+        type='BEV2DFCN',
+        flatten_height=True,
+        height=occ_h,
+        in_channels = _dim_ + 32,
+        mid_channels= fcn_dim_,
+        out_channels = _dim_,
+    ),
+
+    # sparse_conv_encoder = dict(
+    #     type='Sparse',
     #     embed_dims=_dim_,
     #     num_heads=_num_heads_,
     #     mlp_ratio=2
@@ -208,10 +235,10 @@ model = dict(
         out_channel=num_cls,
         point_cloud_range=point_cloud_range,
         loss_weight_cfg=dict(
-            loss_cos_sim_weight=2.0,
-            loss_voxel_ce_weight=1.0,
+            loss_cos_sim_weight=1.0,
+            loss_voxel_ce_weight=0.2,
             loss_voxel_sem_scal_weight=1.0,
-            loss_voxel_geo_scal_weight=1.0,
+            loss_voxel_geo_scal_weight=0.5,
             loss_voxel_lovasz_weight=1.0,
         ),
     ),
@@ -251,7 +278,7 @@ train_pipeline = [
     
     dict(type='DefaultFormatBundle3D', class_names=class_names),
     dict(
-        type='Collect3D', keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d',  'gt_occupancy', 'gt_depth'
+        type='Collect3D', keys=['img_inputs', 'gt_bboxes_3d', 'gt_labels_3d',  'gt_occupancy', 'gt_depth', 'cam_visible_mask'
                                ])
     ####formating.py
 ]
@@ -278,7 +305,7 @@ test_pipeline = [
                 type='DefaultFormatBundle3D',
                 class_names=class_names,
                 with_label=False),
-            dict(type='Collect3D', keys=['points', 'img_inputs',  'gt_occupancy', 'visible_mask'])
+            dict(type='Collect3D', keys=['points', 'img_inputs',  'gt_occupancy', 'cam_visible_mask'])
             ]
         )
 ]
@@ -302,7 +329,7 @@ share_data_config = dict(
 test_data_config = dict(
     pipeline=test_pipeline,
     sequences_split_num=test_sequences_split_num,
-    ann_file=data_root + 'single_scene_overfit.pkl')#'bevdetv2-nuscenes_infos_val.pkl')# 'bevdetv2-nuscenes_infos_val.pkl')
+    ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl')#'bevdetv2-nuscenes_infos_val.pkl')# 'bevdetv2-nuscenes_infos_val.pkl')
 
 data = dict(
     samples_per_gpu=samples_per_gpu,
@@ -311,7 +338,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'single_scene_overfit.pkl',#'bevdetv2-nuscenes_infos_train.pkl', # half_scene_train.pkl, single_scene_overfit.pkl
+        ann_file=data_root + 'bevdetv2-nuscenes_infos_train.pkl',#'bevdetv2-nuscenes_infos_train.pkl', # half_scene_train.pkl, single_scene_overfit.pkl
         pipeline=train_pipeline,
         classes=class_names,
         test_mode=False,

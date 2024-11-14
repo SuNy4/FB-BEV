@@ -14,9 +14,11 @@ import math
 @NECKS.register_module()
 class TransformerLayer(nn.Module):
 
-    def __init__(self, embed_dims, num_heads, mlp_ratio=4, kdim=None, vdim=None
+    def __init__(self, embed_dims, num_heads, out_dims=None, mlp_ratio=4, kdim=None, vdim=None
                  , qkv_bias=True, norm_layer=nn.LayerNorm):
         super().__init__()
+        if out_dims == None:
+            out_dims = embed_dims
         self.embed_dims = embed_dims
         self.norm1 = norm_layer(embed_dims)
         self.attn = nn.MultiheadAttention(embed_dims, num_heads, bias=qkv_bias, 
@@ -24,11 +26,11 @@ class TransformerLayer(nn.Module):
 
         if mlp_ratio == 0:
             return
-        self.norm2 = norm_layer(embed_dims)
+        self.norm2 = norm_layer(out_dims)
         self.ffn = nn.Sequential(
-            nn.Linear(embed_dims, embed_dims * mlp_ratio),
+            nn.Linear(out_dims, out_dims * mlp_ratio),
             nn.GELU(),
-            nn.Linear(embed_dims * mlp_ratio, embed_dims),
+            nn.Linear(out_dims * mlp_ratio, embed_dims),
         )
 
     def forward(self, query, key=None, value=None, query_pos=None, key_pos=None):
@@ -39,9 +41,10 @@ class TransformerLayer(nn.Module):
             key = key + key_pos
         if query_pos is not None:
             query = query + self.attn(self.norm1(query) + query_pos, key, value)[0]
+            weights = None
         else:
-            attn_results, weights = self.attn(self.norm1(query), key, value, need_weights=True)
-            query = query + attn_results
+            query, weights = self.attn(self.norm1(query), key, value, need_weights=True)
+            # query = query + attn_results
         if not hasattr(self, 'ffn'):
             return query
         query = query + self.ffn(self.norm2(query))
