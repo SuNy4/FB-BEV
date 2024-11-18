@@ -216,28 +216,28 @@ class OccHead(BaseModule):
 
     @force_fp32()
     def forward_sparse(self, sparse_feats=None, sparse_idx=None, **kwargs):
-        # voxel feats: bs, N, C
+        # sparse feats: bs, D, W, H, 50
+        bs, D, W, H, _ = sparse_feats.shape
+        sparse_feats = sparse_feats.flatten(start_dim=1, end_dim=3)
+        sparse_feats = self.mlphead(sparse_feats.permute(0, 2, 1)) # bs, Classes, DWH
+        voxel_feats = sparse_feats.reshape(bs, -1, D, W, H)
+        ## voxel feats: bs, N, C
         #
-        bs, N, C = sparse_feats.shape
-        # sparse_feats = self.mlphead(sparse_feats.permute(0, 2, 1)).permute(0, 2, 1)
+        # bs, N, C = sparse_feats.shape
+        # sparse_feats = self.mlphead(sparse_feats.permute(0, 2, 1)).permute(0, 2, 1) # bs, N, class
+        # sparse_feats = F.softmax(sparse_feats, dim=-1)
         # sparse_zeros = torch.zeros(bs, N, 1).cuda()
         # sparse_feats = torch.cat((sparse_zeros, sparse_feats), dim=2)
-        # sparse_feats = F.softmax(sparse_feats, dim=-1)
-        voxel_feats = torch.zeros(bs, 100, 100, 8, C).cuda()
-        # voxel_feats = torch.zeros(bs, 100, 100, 8, self.out_channel+1).cuda()
-        # voxel_feats[:, :, :, :, 0] = 1
         
-        for i, index in enumerate(sparse_idx):
-            d_indices = index[:, 0]
-            w_indices = index[:, 1]
-            h_indices = index[:, 2]
-            voxel_feats[i, d_indices, w_indices, h_indices] = sparse_feats[i, :len(index)]
+        # voxel_feats = torch.ones(bs, 200, 200, 16, self.out_channel+1).cuda()
+        
+        # for i, index in enumerate(sparse_idx):
+        #     d_indices = index[:, 0]
+        #     w_indices = index[:, 1]
+        #     h_indices = index[:, 2]
+        #     voxel_feats[i, d_indices, w_indices, h_indices] = sparse_feats[i, :len(index)]
 
-        voxel_feats = voxel_feats.permute(0, 4, 1, 2, 3)  #
-        voxel_feats = F.interpolate(voxel_feats, scale_factor=2, mode='trilinear', align_corners=False)
-
-        voxel_feats = self.mlphead(voxel_feats.flatten(2,4))
-        voxel_feats = voxel_feats.reshape(bs, -1, 200, 200, 16)
+        # voxel_feats = voxel_feats.permute(0, 4, 1, 2, 3)
         
 
         res = {
@@ -285,8 +285,8 @@ class OccHead(BaseModule):
     @force_fp32() 
     def loss_voxel(self, output_voxels, target_voxels, cam_mask, tag, **kwargs):
         
-        kwargs['results']['geom'] = F.interpolate(kwargs['results']['geom'].unsqueeze(1), scale_factor=2, mode='trilinear', align_corners=False).squeeze(1)
-        kwargs['results']['pred_cam_mask'] = F.interpolate(kwargs['results']['pred_cam_mask'].unsqueeze(1), scale_factor=2, mode='trilinear', align_corners=False).squeeze(1)
+        # kwargs['results']['geom'] = F.interpolate(kwargs['results']['geom'].unsqueeze(1), scale_factor=2, mode='trilinear', align_corners=False).squeeze(1)
+        # kwargs['results']['pred_cam_mask'] = F.interpolate(kwargs['results']['pred_cam_mask'].unsqueeze(1), scale_factor=2, mode='trilinear', align_corners=False).squeeze(1)
 
         # resize gt                       
         B, C, H, W, D = output_voxels.shape
@@ -323,10 +323,10 @@ class OccHead(BaseModule):
         # loss_dict['loss_cos_sim_{}'.format(tag)] = self.loss_cos_sim_weight * cos_sim_loss(kwargs['results']['overlapped_pair'])
         
         # Geometry Affinity Loss for projection & reconstruction
-        loss_dict['loss_voxel_geo_scal_cam_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['pred_cam_mask'], cam_mask, ignore_index=255, non_empty_idx=0, binary=True) #\
+        # loss_dict['loss_voxel_geo_scal_cam_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['pred_cam_mask'], cam_mask, ignore_index=255, non_empty_idx=0, binary=True) #\
                                                            #+ self.loss_cos_sim_weight * cos_sim_loss(kwargs['results']['overlapped_pair'])
-        loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['geom'], target_voxels, ignore_index=255, non_empty_idx=0, binary=True)
-        #loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=0)
+        # loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['geom'], target_voxels, ignore_index=255, non_empty_idx=0, binary=True)
+        loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=0)
                                                         #+ 0.1* self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['geom'], target_voxels, ignore_index=255, non_empty_idx=0, binary=True))/2
         
         loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = self.loss_voxel_sem_scal_weight * sem_scal_loss(output_voxels, target_voxels, ignore_index=0) # Check only 1~17 classes

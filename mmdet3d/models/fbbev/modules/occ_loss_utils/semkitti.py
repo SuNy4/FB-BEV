@@ -85,7 +85,7 @@ def geo_scal_loss(pred, ssc_target, ignore_index=255, non_empty_idx=0, binary=Fa
         nonempty_probs = pred
         empty_probs = 1 - nonempty_probs
     else:
-        pred = F.softmax(pred, dim=1)
+        # pred = F.softmax(pred, dim=1)
         empty_probs = pred[:, non_empty_idx]
         nonempty_probs = 1 - empty_probs
 
@@ -110,10 +110,10 @@ def geo_scal_loss(pred, ssc_target, ignore_index=255, non_empty_idx=0, binary=Fa
 
 
 
-def sem_scal_loss(pred_, ssc_target, ignore_index=255):
+def sem_scal_loss(pred, ssc_target, ignore_index=255):
     # Get softmax probabilities
     with autocast(False):
-        pred = F.softmax(pred_, dim=1)
+        # pred = F.softmax(pred_, dim=1)
         loss = 0
         count = 0
         mask = ssc_target != ignore_index

@@ -6,8 +6,8 @@
 
 
 # we follow the online training settings  from solofusion
-num_gpus = 2
-samples_per_gpu = 3
+num_gpus = 3
+samples_per_gpu = 5
 num_iters_per_epoch = int(28130 // (num_gpus * samples_per_gpu) * 4.554) # single_scene: 120, whole_scene: 28130, half_scene: 13979
 num_epochs = 20
 checkpoint_epoch_interval = 1
@@ -19,7 +19,7 @@ use_custom_eval_hook = True
 # lowering performance. To increase diversity, we split each training sequence
 # in half to ~20 keyframes, and sample these shorter sequences during training.
 # During testing, we do not do this splitting.
-train_sequences_split_num = 2
+train_sequences_split_num = 4
 test_sequences_split_num = 1
 
 # By default, 3D detection datasets randomly choose another sample if there is
@@ -101,7 +101,7 @@ pos_encode_freq = 8
 
 _pos_dim_ = 40
 _ffn_dim_ = numC_Trans * 4
-_num_heads_ = 6
+_num_heads_ = 4
 _num_levels_= 2
 _num_queries_=100
 
@@ -124,7 +124,7 @@ model = dict(
     single_bev_num_channels=numC_Trans,
     readd=True,
     embed_dim=_dim_,
-    N_global_queries=100,
+    N_global_queries=_num_queries_,
     attn_level=_num_levels_,
     grid_config = grid_config,
 
@@ -160,7 +160,7 @@ model = dict(
     img_query_cross_attn=dict(
         type='TransformerLayer',
         embed_dims=_dim_,
-        out_dims=_dim_+(pos_encode_freq*4),
+        # out_dims=_dim_+(pos_encode_freq*4),
         num_heads=_num_heads_,
         mlp_ratio=2
     ),
@@ -175,7 +175,7 @@ model = dict(
     global_pos_self_attn_L1=dict(
         type='TransformerLayer',
         embed_dims=_dim_,
-        out_dims=_dim_+(pos_encode_freq*4),
+        # out_dims=_dim_+(pos_encode_freq*4),
         num_heads=_num_heads_,
         mlp_ratio=2
     ),
@@ -205,33 +205,31 @@ model = dict(
     #     data_config=data_config,
     # ),
 
-    bev_fcn_encoder=dict(
+    fcn_dw_encoder=dict(
         type='BEV2DFCN',
-        flatten_height=True,
+        flatten_height=False,
         height=occ_h,
-        in_channels = _dim_ + 32,
-        mid_channels= fcn_dim_,
+        in_channels = None,
+        mid_channels= _dim_,
         out_channels = _dim_,
     ),
 
-    # sparse_conv_encoder = dict(
-    #     type='Sparse',
-    #     embed_dims=_dim_,
-    #     num_heads=_num_heads_,
-    #     mlp_ratio=2
-    # ),
-    
-    geometry_head = dict(
-        type = 'MLPGeometryHead',
-        input_channels = _dim_,
-        threshold = 0.7
+    fcn_dh_encoder=dict(
+        type='BEV2DFCN',
+        flatten_height=False,
+        height=occ_h,
+        in_channels = None,
+        mid_channels= _dim_,
+        out_channels = _dim_,
     ),
 
-    inst_lvl_self_attn = dict(
-        type='TransformerLayer',
-        embed_dims=_dim_,
-        num_heads=_num_heads_,
-        mlp_ratio=2
+    fcn_wh_encoder=dict(
+        type='BEV2DFCN',
+        flatten_height=False,
+        height=occ_h,
+        in_channels = None,
+        mid_channels= _dim_,
+        out_channels = _dim_,
     ),
 
     backward_projection=None,
@@ -246,7 +244,7 @@ model = dict(
         final_occ_size=occ_size,
         empty_idx=empty_idx,
         num_level=1, #len(voxel_out_indices),
-        in_channels=_dim_, #[voxel_out_channel] * len(voxel_out_indices),
+        in_channels=_num_queries_, #[voxel_out_channel] * len(voxel_out_indices),
         out_channel=num_cls,
         point_cloud_range=point_cloud_range,
         loss_weight_cfg=dict(
@@ -373,7 +371,7 @@ for key in ['val', 'test']:
     data[key].update(share_data_config)
 
 # Optimizer
-lr = 2e-4
+lr = 2e-5
 optimizer = dict(type='AdamW', lr=lr, weight_decay=1e-2)
  
 optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
