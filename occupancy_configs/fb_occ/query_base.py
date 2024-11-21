@@ -96,14 +96,14 @@ occ_h = 8
 numC_Trans=80
 back_dim_=256
 fcn_dim_ = 512
-_dim_ = 128
+_dim_ = 256
 pos_encode_freq = 8
 
 _pos_dim_ = 40
 _ffn_dim_ = numC_Trans * 4
-_num_heads_ = 4
-_num_levels_= 2
-_num_queries_=100
+_num_heads_ = 8
+_num_levels_= 3
+_num_queries_=200
 
 empty_idx = 0  # free class
 num_cls = 18  # 1-17 obj, 0 free
@@ -114,7 +114,7 @@ occ_size = [200, 200, 16]
 voxel_out_indices = (0, 1, 2)
 voxel_out_channel = 256
 voxel_channels = [64, 64*2, 64*4]
-freeze_depthnet_components = False
+freeze_depthnet_components = True
 model = dict(
     type='FBOCC',
     use_depth_supervision=False,
@@ -180,12 +180,12 @@ model = dict(
         mlp_ratio=2
     ),
 
-    global_pos_self_attn_L2=dict(
-        type='TransformerLayer',
-        embed_dims=_dim_,
-        num_heads=_num_heads_,
-        mlp_ratio=2
-    ),
+    # global_pos_self_attn_L2=dict(
+    #     type='TransformerLayer',
+    #     embed_dims=_dim_,
+    #     num_heads=_num_heads_,
+    #     mlp_ratio=2
+    # ),
     
     #     type='TransformerLayer',
     #     embed_dims=_dim_,
@@ -205,32 +205,32 @@ model = dict(
     #     data_config=data_config,
     # ),
 
-    fcn_dw_encoder=dict(
-        type='BEV2DFCN',
-        flatten_height=False,
-        height=occ_h,
-        in_channels = None,
-        mid_channels= _dim_,
-        out_channels = _dim_,
-    ),
+    # fcn_dw_encoder=dict(
+    #     type='BEV2DFCN',
+    #     flatten_height=False,
+    #     height=occ_h,
+    #     in_channels = None,
+    #     mid_channels= _dim_,
+    #     out_channels = _dim_,
+    # ),
 
-    fcn_dh_encoder=dict(
-        type='BEV2DFCN',
-        flatten_height=False,
-        height=occ_h,
-        in_channels = None,
-        mid_channels= _dim_,
-        out_channels = _dim_,
-    ),
+    # fcn_dh_encoder=dict(
+    #     type='BEV2DFCN',
+    #     flatten_height=False,
+    #     height=occ_h,
+    #     in_channels = None,
+    #     mid_channels= _dim_,
+    #     out_channels = _dim_,
+    # ),
 
-    fcn_wh_encoder=dict(
-        type='BEV2DFCN',
-        flatten_height=False,
-        height=occ_h,
-        in_channels = None,
-        mid_channels= _dim_,
-        out_channels = _dim_,
-    ),
+    # fcn_wh_encoder=dict(
+    #     type='BEV2DFCN',
+    #     flatten_height=False,
+    #     height=occ_h,
+    #     in_channels = None,
+    #     mid_channels= _dim_,
+    #     out_channels = _dim_,
+    # ),
 
     backward_projection=None,
 
@@ -244,14 +244,14 @@ model = dict(
         final_occ_size=occ_size,
         empty_idx=empty_idx,
         num_level=1, #len(voxel_out_indices),
-        in_channels=_num_queries_, #[voxel_out_channel] * len(voxel_out_indices),
+        in_channels=_dim_, #[voxel_out_channel] * len(voxel_out_indices),
         out_channel=num_cls,
         point_cloud_range=point_cloud_range,
         loss_weight_cfg=dict(
             loss_cos_sim_weight=1.0,
-            loss_voxel_ce_weight=0.2,
+            loss_voxel_ce_weight=0.5,
             loss_voxel_sem_scal_weight=1.0,
-            loss_voxel_geo_scal_weight=0.5,
+            loss_voxel_geo_scal_weight=2.0,
             loss_voxel_lovasz_weight=1.0,
         ),
     ),
@@ -371,14 +371,14 @@ for key in ['val', 'test']:
     data[key].update(share_data_config)
 
 # Optimizer
-lr = 2e-5
-optimizer = dict(type='AdamW', lr=lr, weight_decay=1e-2)
+lr = 1e-4
+optimizer = dict(type='AdamW', lr=lr, weight_decay=0.001)
  
 optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
 lr_config = dict(
     policy='step',
     warmup='linear',
-    warmup_iters=200,
+    warmup_iters=300,
     warmup_ratio=0.001,
     step=[num_iters_per_epoch*num_epochs,])
 runner = dict(type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)

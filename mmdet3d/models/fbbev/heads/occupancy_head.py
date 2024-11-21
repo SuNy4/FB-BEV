@@ -46,16 +46,26 @@ class OccHead(BaseModule):
         super(OccHead, self).__init__()
 
         self.fp16_enabled=False
-        
+
         self.mlphead = nn.Sequential(
-            nn.Conv1d(in_channels, 128, kernel_size=1),
-            nn.BatchNorm1d(128),
+            nn.Linear(in_channels, 128),
+            nn.LayerNorm(128),
             nn.GELU(),
-            nn.Conv1d(128, 64, kernel_size=1),
-            nn.BatchNorm1d(64),
+            nn.Linear(128, 64),
+            nn.LayerNorm(64),
             nn.GELU(),
-            nn.Conv1d(64, out_channel, kernel_size=1),
-        )
+            nn.Linear(64, out_channel),
+        )        
+        
+        # self.mlphead = nn.Sequential(
+        #     nn.Conv1d(in_channels, 128, kernel_size=1),
+        #     nn.BatchNorm1d(128),
+        #     nn.GELU(),
+        #     nn.Conv1d(128, 64, kernel_size=1),
+        #     nn.BatchNorm1d(64),
+        #     nn.GELU(),
+        #     nn.Conv1d(64, out_channel, kernel_size=1),
+        # )
       
         if type(in_channels) is not list:
             in_channels = [in_channels]
@@ -215,12 +225,26 @@ class OccHead(BaseModule):
         return res
 
     @force_fp32()
-    def forward_sparse(self, sparse_feats=None, sparse_idx=None, **kwargs):
+    def forward_sparse(self, feats=None, sparse_idx=None, **kwargs):
         # sparse feats: bs, D, W, H, 50
-        bs, D, W, H, _ = sparse_feats.shape
-        sparse_feats = sparse_feats.flatten(start_dim=1, end_dim=3)
-        sparse_feats = self.mlphead(sparse_feats.permute(0, 2, 1)) # bs, Classes, DWH
-        voxel_feats = sparse_feats.reshape(bs, -1, D, W, H)
+        # sparse idx: bs, DWH
+        bs, D, W, H, _ = feats.shape
+        feats = feats.flatten(start_dim=1, end_dim=3)
+        feats = self.mlphead(feats).permute(0, 2, 1).reshape(bs, -1, D, W, H) # bs, classes, DWH
+        # feats = torch.softmax(feats, dim=1)
+        ########################################################
+        # sparse_feats = [feats[i, sparse_idx[i]] for i in range(bs)]
+        # feats = torch.zeros(bs, D*W*H, self.out_channel, device=feats.device) #bs, DWH, 17 no free cls
+        
+        # for i in range(bs):
+        #     sparse_feats[i] = self.mlphead(sparse_feats[i].unsqueeze(0)).squeeze(0)
+        #     feats[i, sparse_idx[i]] = sparse_feats[i]
+        
+        # feats = F.softmax(feats, dim=-1) # bs, DWH, 17
+        # feats = torch.cat([(~sparse_idx).unsqueeze(-1).float(), feats], dim=-1).permute(0, 2, 1) # bs, 18, DWH
+        # feats = feats.reshape(bs, -1, D, W, H) # bs, 18, D, W, H
+        ########################################################
+
         ## voxel feats: bs, N, C
         #
         # bs, N, C = sparse_feats.shape
@@ -241,7 +265,7 @@ class OccHead(BaseModule):
         
 
         res = {
-            'output_voxels': [voxel_feats],  ## bs, C, D, W, H
+            'output_voxels': [feats],  ## bs, C, D, W, H
             'output_voxels_fine': None,
             'output_coords_fine': None,
         }
@@ -329,7 +353,7 @@ class OccHead(BaseModule):
         loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=0)
                                                         #+ 0.1* self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['geom'], target_voxels, ignore_index=255, non_empty_idx=0, binary=True))/2
         
-        loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = self.loss_voxel_sem_scal_weight * sem_scal_loss(output_voxels, target_voxels, ignore_index=0) # Check only 1~17 classes
+        loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = self.loss_voxel_sem_scal_weight * sem_scal_loss(output_voxels, target_voxels, ignore_index=255) # Check only 1~17 classes
         
          # Check Free area
         #####

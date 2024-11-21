@@ -34,20 +34,24 @@ class TransformerLayer(nn.Module):
         )
 
     def forward(self, query, key=None, value=None, query_pos=None, key_pos=None):
+        # Query: bs, N, C
         if key is None and value is None:
             key = value = query
             key_pos = query_pos
         if key_pos is not None:
             key = key + key_pos
+        # Adaptive Mixing
+        # query = 
+
         if query_pos is not None:
             query = query + self.attn(self.norm1(query) + query_pos, key, value)[0]
             weights = None
         else:
-            query, weights = self.attn(self.norm1(query), key, value, need_weights=True)
-            # query = query + attn_results
+            attn_results, weights = self.attn(query, key, value, need_weights=True)
+            query = self.norm1(query + attn_results)
         if not hasattr(self, 'ffn'):
             return query
-        query = query + self.ffn(self.norm2(query))
+        query = self.norm2(query + self.ffn(query))
         return query, weights
 
 

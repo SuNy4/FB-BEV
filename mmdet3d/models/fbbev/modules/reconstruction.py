@@ -153,12 +153,12 @@ class PosDeformableTransformerLayer(nn.Module):
 
         if dim == '3d':
 
-            X = torch.arange(*self.x_bound, dtype=torch.float) # + self.x_bound[-1]/2
-            Y = torch.arange(*self.y_bound, dtype=torch.float) # + self.y_bound[-1]/2
-            Z = torch.arange(*self.z_bound, dtype=torch.float) # + self.z_bound[-1]/2
+            X = torch.arange(*self.x_bound, dtype=torch.float, device='cuda') # + self.x_bound[-1]/2
+            Y = torch.arange(*self.y_bound, dtype=torch.float, device='cuda') # + self.y_bound[-1]/2
+            Z = torch.arange(*self.z_bound, dtype=torch.float, device='cuda') # + self.z_bound[-1]/2
             Y, X, Z = torch.meshgrid([Y, X, Z])
             coords = torch.stack([X, Y, Z], dim=-1)
-            coords = coords.to(dtype).to(device)
+            # coords = coords.to(dtype).to(device)
 
             return coords
         
@@ -632,8 +632,8 @@ class CamPosEncoder(nn.Module):
 
                 assert (self.input_dim[1] // W) == (self.input_dim[0] // H)
 
-                u = torch.linspace(0, W - 1, W).to(img_context.device)
-                v = torch.linspace(0, H - 1, H).to(img_context.device)
+                u = torch.linspace(0, W - 1, W, device=img_context.device)
+                v = torch.linspace(0, H - 1, H, device=img_context.device)
 
                 u, v = torch.meshgrid(u, v, indexing='ij')
                 img_grid = torch.stack([u, v], dim=-1).flatten(0, 1)

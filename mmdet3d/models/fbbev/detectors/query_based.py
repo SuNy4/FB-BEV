@@ -5,6 +5,7 @@
 # https://github.com/NVlabs/FB-BEV/blob/main/LICENSE
 
 import torch
+from torch.profiler import profile, ProfilerActivity
 import torch.nn.functional as F
 import torch.nn as nn
 from mmcv.runner import force_fp32
@@ -110,7 +111,8 @@ class FBOCC(CenterPoint):
         #FIOcc init
         self.main_queries = nn.Embedding(N_global_queries, embed_dim) if N_global_queries else None
         self.pos_encoder = builder.build_neck(pos_encoder) if pos_encoder else None
-        self.img_query_cross_attn = builder.build_neck(img_query_cross_attn) if img_query_cross_attn else None
+        self.img_query_cross_attn_L1 = builder.build_neck(img_query_cross_attn) if img_query_cross_attn else None
+        self.img_query_cross_attn_L2 = builder.build_neck(img_query_cross_attn) if img_query_cross_attn else None
         self.query_self_attn = builder.build_neck(query_self_attn) if query_self_attn else None
         self.global_pos_self_attn_L1 = builder.build_neck(global_pos_self_attn_L1) if global_pos_self_attn_L1 else None
         self.global_pos_self_attn_L2 = builder.build_neck(global_pos_self_attn_L2) if global_pos_self_attn_L2 else None
@@ -125,8 +127,85 @@ class FBOCC(CenterPoint):
    
 
         # FC layer
+        self.norm1 = nn.LayerNorm(embed_dim, device='cuda')
+        # fc_layer_1 = nn.Sequential(
+        #     nn.Linear(input_c, input_c*2),
+        #     nn.GELU(),
+        #     nn.Linear(input_c*2, C)
+        # ).to('cuda')
+        self.fc_layer_1 = nn.Sequential(
+            nn.Linear(embed_dim+32, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.ReLU()
+        ).to('cuda')
 
+        self.norm2 = nn.LayerNorm(embed_dim, device='cuda')
+        self.fc_layer_2 = nn.Sequential(
+            nn.Linear(embed_dim+32, embed_dim),
+            nn.LayerNorm(embed_dim),
+            nn.ReLU()
+        ).to('cuda')
+        
+        # self.fc_layer_3 = nn.Sequential(
+        #     nn.Linear(6, 6),
+        #     nn.LayerNorm(6),
+        #     nn.ReLU()
+        # ).to('cuda')
 
+        D = 200
+        W = 200
+        H = 16
+        D = torch.linspace(self.grid_config['x'][0], self.grid_config['x'][1], D, device='cuda')
+        W = torch.linspace(self.grid_config['y'][0], self.grid_config['y'][1], W, device='cuda')
+        H = torch.linspace(self.grid_config['z'][0], self.grid_config['z'][1], H, device='cuda')
+
+        d, w = torch.meshgrid(D, W, indexing='ij')
+        self.dw_plane = torch.stack([d, w], dim=-1)# 200x200x2
+                
+        d, h = torch.meshgrid(D, H, indexing='ij')
+        self.dh_plane = torch.stack([d, h], dim=-1)
+        
+        w, h = torch.meshgrid(W, H, indexing='ij')
+        self.wh_plane = torch.stack([w, h], dim=-1)
+
+        self.dw_layer = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim//2),
+            nn.LayerNorm(embed_dim//2),
+            nn.GELU(),
+            nn.Linear(embed_dim//2, 32),
+        ).to('cuda')
+        
+        self.dh_layer = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim//2),
+            nn.LayerNorm(embed_dim//2),
+            nn.GELU(),
+            nn.Linear(embed_dim//2, 32),
+        ).to('cuda')
+
+        self.wh_layer = nn.Sequential(
+            nn.Linear(embed_dim, embed_dim//2),
+            nn.LayerNorm(embed_dim//2),
+            nn.GELU(),
+            nn.Linear(embed_dim//2, 32),
+        ).to('cuda')
+        ##############################
+        # d, w, h = torch.meshgrid(D, W, H, indexing='ij')
+
+        # r = torch.sqrt(d**2 + w**2 + h**2)
+        # theta = torch.atan2(w, d)
+        # phi = torch.acos(h / (r + 1e-8))
+
+        # spherical_coords = torch.stack([r, theta, phi], dim=-1)
+ 
+        # self.sph_encoded = self.pos_encoder(spherical_coords, map_input=True)
+
+        # self.sph_layer = nn.Sequential(
+        #     nn.Linear(embed_dim, embed_dim//2),
+        #     nn.LayerNorm(embed_dim//2),
+        #     nn.GELU(),
+        #     nn.Linear(embed_dim//2, 48)
+        # ).to('cuda')
+        ##############################
         # BEVFormer init
         self.backward_projection = builder.build_head(backward_projection) if backward_projection else None
     
@@ -377,7 +456,7 @@ class FBOCC(CenterPoint):
             img_local_pos_encode = self.pos_encoder(context, *cam_params, mode='Local') # bs, Ncam, WH, num_freqs*4
             img_local_pos_encode = img_local_pos_encode.flatten(0, 1) # bsNcam, WH, num_freqs*4
 
-        if self.with_specific_component('img_query_cross_attn'):
+        if self.with_specific_component('img_query_cross_attn_L1'):
             bs, Ncam, C, W, H = context.shape
 
             context = context.flatten(-2, -1)
@@ -385,21 +464,23 @@ class FBOCC(CenterPoint):
             general_queries = self.main_queries.weight
             global_queries = general_queries.unsqueeze(0).repeat(bs*Ncam, 1, 1) # bsNcam, N, C
 
-            value = torch.cat([context, img_local_pos_encode], dim=-1)
+            value = torch.cat([context, img_local_pos_encode], dim=-1) # bsNcam, WH, C+32
             input_c = value.shape[2]
-            fc_layer_1 = nn.Sequential(
-                nn.Linear(input_c, input_c*2),
-                nn.GELU(),
-                nn.Linear(input_c*2, C)
-            ).to('cuda')
-            value = fc_layer_1(value)
+
+            value = self.norm1(context + self.fc_layer_1(value)) # bsNcam, WH, C
 
             # Find instance unrelated to img position, only value have image position info, since queries are general
-            inst_queries, attn_weights = self.img_query_cross_attn(
+            inst_queries, attn_weights = self.img_query_cross_attn_L1(
                 query = global_queries,
                 key = context,
                 value = value
             )
+            for _ in range(self.num_levels):
+                inst_queries, _ = self.img_query_cross_attn_L2(
+                    query = inst_queries,
+                    key = value,
+                    value = value,
+                )
             # inst_queries: bs*Ncam, N_queries, C
             # attn_weights: bs*Ncam, N_queries, WH
             _, max_indices = torch.max(attn_weights, dim=-1) # bs*Ncam, N_queries
@@ -414,118 +495,203 @@ class FBOCC(CenterPoint):
             # sph_coords: bs, Ncam*N_queries, 2 (theta, phi)
 
         if self.with_specific_component('query_self_attn'):
-            inst_queries, _ = self.query_self_attn(
-                query = inst_queries
-            ) # bsNCam, N_queries, C
+            for _ in range(self.num_levels):
+                inst_queries, _ = self.query_self_attn(
+                    query = inst_queries
+                ) # bsNCam, N_queries, C
+        #################################################################################
+        # if self.with_specific_component('global_pos_self_attn_L1'):
+            
+        #     value = torch.cat([inst_queries, query_global_pos_encode], dim=-1)
+        #     input_c = value.shape[2]
+        #     fc_layer_2 = nn.Sequential(
+        #         nn.Linear(input_c, input_c*2),
+        #         nn.GELU(),
+        #         nn.Linear(input_c*2, C)
+        #     ).to('cuda')
+        #     value = fc_layer_2(value)
+
+        #     inst_queries, _ = self.global_pos_self_attn_L1(
+        #         query = inst_queries,
+        #         key = inst_queries,
+        #         value = value
+        #     ) # bsNCam, N_queries, C
+
+        # if self.with_specific_component('global_pos_self_attn_L2'):
+        #     inst_queries, _ = self.global_pos_self_attn_L2(
+        #         query = inst_queries,
+        #     ) # bsNCam, N_queries, C
 
         if self.with_specific_component('global_pos_self_attn_L1'):
-            
-            value = torch.cat([inst_queries, query_global_pos_encode], dim=-1)
-            input_c = value.shape[2]
-            fc_layer_2 = nn.Sequential(
-                nn.Linear(input_c, input_c*2),
-                nn.GELU(),
-                nn.Linear(input_c*2, C)
-            ).to('cuda')
-            value = fc_layer_2(value)
+            init_inst_que = inst_queries
+            inst_queries = torch.cat([inst_queries, query_global_pos_encode], dim=-1) # bsNCam, N_queries, C+32
+            input_c = inst_queries.shape[2]
 
-            inst_queries, _ = self.global_pos_self_attn_L1(
-                query = inst_queries,
-                key = inst_queries,
-                value = value
-            ) # bsNCam, N_queries, C
+            inst_queries = self.fc_layer_2(inst_queries) # bsNCam, N_queries, C
+            inst_queries = inst_queries.reshape(bs, Ncam, -1, C).permute(0, 2, 3, 1)
 
-        if self.with_specific_component('global_pos_self_attn_L2'):
-            inst_queries, _ = self.global_pos_self_attn_L2(
-                query = inst_queries,
-            ) # bsNCam, N_queries, C
+            # inst_queries = self.fc_layer_3(inst_queries) # bs, N_queries, C, Ncam
+            inst_queries = inst_queries.permute(0, 3, 1, 2).flatten(0, 1) # bsNcam, N_queries, C
+            ##########
+            inst_queries = self.norm2(inst_queries + init_inst_que)
 
+            # _, _, input_c = inst_queries.shape
+            # inst_queries = inst_queries.reshape(bs, Ncam, -1, input_c) # bs, Ncam, N_queries, C
+            # inst_queries = inst_queries.flatten(1, 2) # bs, Ncam*N_queries, C
+            for _ in range(self.num_levels):
+                inst_queries, _ = self.global_pos_self_attn_L1(
+                    query = inst_queries
+                ) # bsNCam, N_queries, C
+        ####################################################################
+            # occ_feat = self.sph_encoded[None, :].repeat(bs, 1, 1, 1, 1) # bs, 200 200 16 48
+            # _, D, W, H, _ = occ_feat.shape
+
+            # inst_queries = inst_queries.reshape(bs, Ncam, -1, C).flatten(1, 2)
+            # inst_queries = self.sph_layer(inst_queries) # bs, Ncam*Nqueries, 48
+            # occ_feat = torch.einsum('bdwhc,bnc->bdwhn', occ_feat, inst_queries).sigmoid()
+            # occ_feat = occ_feat / (occ_feat.max() + 1e-8)
+
+            # threshold = 0.5
+            # mask = (occ_feat < threshold).all(dim=-1) # bs, D*W*H
+            # occ_feat[mask] = 0
+
+            # global_queries = global_queries.reshape(bs, Ncam, -1, C).flatten(1, 2)
+            # occ_feat = torch.einsum('bdwhn,bnc->bdwhc', occ_feat, global_queries)
+        ####################################################################
         # if self.with_specific_component('radius_mlp'):
-            _, _, input_c = inst_queries.shape
-            inst_queries = inst_queries.reshape(bs, Ncam, -1, input_c) # bs, Ncam, N_queries, C
-            inst_queries = inst_queries.flatten(1, 2) # bs, Ncam*N_queries, C
+            # _, _, input_c = inst_queries.shape
+            # inst_queries = inst_queries.reshape(bs, Ncam, -1, C) # bs, Ncam, N_queries, C
+            # inst_queries = inst_queries.flatten(1, 2) # bs, Ncam*N_queries, C
             
-            fc_layer_3 = nn.Sequential(
-                nn.Linear(input_c, input_c*2),
-                nn.GELU(),
-                nn.Linear(input_c*2, 100)
-            ).to('cuda')
+            # fc_layer_3 = nn.Sequential(
+            #     nn.Linear(C, C*2),
+            #     nn.LayerNorm(C*2),
+            #     nn.ReLU(),
+            #     nn.Linear(C*2, 100),
+            # ).to('cuda')
             
-            logits = fc_layer_3(inst_queries) # bs, Ncam*N_queries, 100
-            r_prob = F.softmax(logits, dim=-1) # bs, Ncam*N_queries, 100
+            # logits = fc_layer_3(inst_queries) # bs, Ncam*N_queries, 100
+            # r_prob = F.softmax(logits, dim=-1) # bs, Ncam*N_queries, 100
             
-            r = torch.argmax(r_prob, dim=-1).unsqueeze(-1) * 0.4 # bs, Ncam*N_queries, 1
-            # sph_coords = torch.cat(r_prob, sph_coords, dim=-1) # bs, Ncam*N_quries, 3 (r, theta, phi)
-            theta = sph_coords[..., 0].unsqueeze(-1)
-            phi = sph_coords[..., 1].unsqueeze(-1)
+            # r = torch.argmax(r_prob, dim=-1).unsqueeze(-1) * 0.4 # bs, Ncam*N_queries, 1
+            # # sph_coords = torch.cat(r_prob, sph_coords, dim=-1) # bs, Ncam*N_quries, 3 (r, theta, phi)
+            # theta = sph_coords[..., 0].unsqueeze(-1) # bs, Ncam*N_queries, 1
+            # phi = sph_coords[..., 1].unsqueeze(-1) # bs, Ncam*N_queries, 1
             
-            ###Spherical to Cartisian idx###
-            D = r * torch.cos(phi) * torch.cos(theta) - self.grid_config['x'][0]  
-            W = r * torch.cos(phi) * torch.sin(theta) - self.grid_config['y'][0] 
-            H = r * torch.sin(phi) - self.grid_config['z'][0] 
+            # ###Spherical to Cartisian idx###
+            # D = r * torch.cos(phi) * torch.cos(theta) - self.grid_config['x'][0]  
+            # W = r * torch.cos(phi) * torch.sin(theta) - self.grid_config['y'][0] 
+            # H = r * torch.sin(phi) - self.grid_config['z'][0] 
             
-            D = torch.clamp((D / 0.4).long(), 0, 199) # bs, Ncam*N_queries, 1
-            W = torch.clamp((W / 0.4).long(), 0, 199) # bs, Ncam*N_queries, 1
-            H = torch.clamp((H / 0.4).long(), 0, 15) # bs, Ncam*N_queries, 1
+            # D = torch.clamp((D / 0.4).long(), 0, 199) # bs, Ncam*N_queries, 1
+            # W = torch.clamp((W / 0.4).long(), 0, 199) # bs, Ncam*N_queries, 1
+            # H = torch.clamp((H / 0.4).long(), 0, 15) # bs, Ncam*N_queries, 1
 
-            cart_idx = torch.cat([D, W, H], dim=-1) # bs, Ncam*N_queries, 3
-
+            # cart_idx = torch.cat([D, W, H], dim=-1) # bs, Ncam*N_queries, 3
+            # # cart_idx = cart_idx.reshape(bs, Ncam, -1, 3).flatten(1, 2)
+        ######################################################################
         #if self.with_specific_component('TPV_FCN'):
-            D = 200
-            W = 200
-            H = 16
-            D = torch.linspace(self.grid_config['x'][0], self.grid_config['x'][1], D).to('cuda')
-            W = torch.linspace(self.grid_config['y'][0], self.grid_config['y'][0], W).to('cuda')
-            H = torch.linspace(self.grid_config['z'][0], self.grid_config['z'][0], H).to('cuda')
+            dw_plane = self.dw_plane[None, :].repeat(bs, 1, 1, 1)
+            dh_plane = self.dh_plane[None, :].repeat(bs, 1, 1, 1)
+            wh_plane = self.wh_plane[None, :].repeat(bs, 1, 1, 1)
 
-            d, w = torch.meshgrid(D, W, indexing='ij')
-            dw_plane = torch.stack([d, w], dim=-1)# 200x200x2
-            dw_plane = dw_plane[None, :].repeat(bs, 1, 1, 1)     
+            dw_plane = self.pos_encoder(dw_plane, map_input=True).flatten(1, 2) # bs, 200x200, 32
+            dh_plane = self.pos_encoder(dh_plane, map_input=True).flatten(1, 2) # bs, 200x16, 32
+            wh_plane = self.pos_encoder(wh_plane, map_input=True).flatten(1, 2) # bs, 200x16, 32
+            inst_queries = inst_queries.reshape(bs, Ncam, -1, C).flatten(1, 2) # bs, Ncam, N_queries, C
 
-            d, h = torch.meshgrid(D, H, indexing='ij')
-            dh_plane = torch.stack([d, h], dim=-1)
-            dh_plane = dh_plane[None, :].repeat(bs, 1, 1, 1)
+            dw = self.dw_layer(inst_queries).permute(0, 2, 1) # bs, 32, Ncam*Nqueries
+            dh = self.dh_layer(inst_queries).permute(0, 2, 1) # bs, 32, Ncam*Nqueries
+            wh = self.wh_layer(inst_queries).permute(0, 2, 1) # bs, 32, Ncam*Nqueries
 
-            w, h = torch.meshgrid(W, H, indexing='ij')
-            wh_plane = torch.stack([w, h], dim=-1)
-            wh_plane = wh_plane[None, :].repeat(bs, 1, 1, 1)
-
-            dw_plane = self.pos_encoder(dw_plane, map_input=True)
-            dh_plane = self.pos_encoder(dh_plane, map_input=True)
-            wh_plane = self.pos_encoder(wh_plane, map_input=True)
-
-            zero_pad = torch.zeros(bs, 200, 200, 96).to(dw_plane.device)
-            dw_plane = torch.cat([zero_pad, dw_plane], dim=-1)
-            zero_pad = torch.zeros(bs, 200, 16, 96).to(dh_plane.device)
-            dh_plane = torch.cat([zero_pad, dh_plane], dim=-1)
-            wh_plane = torch.cat([zero_pad, wh_plane], dim=-1)
-
-            for i, index in enumerate(cart_idx):
-                d_indices = index[:, 0]
-                w_indices = index[:, 1]
-                h_indices = index[:, 2]
-                dw_plane[i, d_indices, w_indices] = inst_queries[i, :len(index)]
-                dh_plane[i, d_indices, h_indices] = inst_queries[i, :len(index)]
-                wh_plane[i, w_indices, h_indices] = inst_queries[i, :len(index)]
-
-            dw_plane = self.fcn_dw_encoder(dw_plane.permute(0, 3, 1, 2)).permute(0, 2, 3, 1).unsqueeze(3)
-            dh_plane = self.fcn_dh_encoder(dh_plane.permute(0, 3, 1, 2)).permute(0, 2, 3, 1).unsqueeze(2)
-            wh_plane = self.fcn_wh_encoder(wh_plane.permute(0, 3, 1, 2)).permute(0, 2, 3, 1).unsqueeze(1)
-
-            occ_feat = dw_plane * dh_plane * wh_plane
-            bs, D, W, H, _ = occ_feat.shape
-            input_reshaped = occ_feat.view(bs, D * W * H, C)  # bs, D*W*H, C
-            query_reshaped = general_queries.t()  # C, N
-            occ_feat = torch.bmm(input_reshaped, query_reshaped.unsqueeze(0).expand(bs, -1, -1))  # bs, D*W*H, N
-            # occ_feat = occ_feat.view(bs, D, W, H, -1).sigmoid()
+            # dw_plane = torch.softmax(torch.einsum('bijk,bkl->bijl', dw_plane, dw), dim=-1) # bs, 200, 200, Ncam*Nqueries
+            # dh_plane = torch.softmax(torch.einsum('bijk,bkl->bijl', dh_plane, dh), dim=-1) # bs, 200, 16, Ncam*Nqueries
+            # wh_plane = torch.softmax(torch.einsum('bijk,bkl->bijl', wh_plane, wh), dim=-1) # bs, 200, 16, Ncam*Nqueries
+            dw_plane = torch.matmul(dw_plane, dw).sigmoid() # bs, 200x200, Ncam*Nqueries
+            dh_plane = torch.matmul(dh_plane, dh).sigmoid() # bs, 200x16, Ncam*Nqueries
+            wh_plane = torch.matmul(wh_plane, wh).sigmoid() # bs, 200x16, Ncam*Nqueries
             
-            threshold = 0.4
-            mask = (occ_feat.clone().sigmoid() <= threshold).all(dim=-1)
+            dw_plane = dw_plane / (dw_plane.max() + 1e-8)
+            dh_plane = dh_plane / (dh_plane.max() + 1e-8)
+            wh_plane = wh_plane / (wh_plane.max() + 1e-8)
+
+            threshold = 0.5
+            mask = (dw_plane < threshold).all(dim=-1)
+            dw_plane[mask] = 0
+            mask = (dh_plane < threshold).all(dim=-1)
+            dh_plane[mask] = 0
+            mask = (wh_plane < threshold).all(dim=-1)
+            wh_plane[mask] = 0
+
+            global_queries = global_queries.flatten(0, 1).reshape(bs, -1, C)
+
+            dw_plane = torch.matmul(dw_plane, global_queries).reshape(bs, 200, 200, -1).unsqueeze(-2) # bs, 200 200, 256
+            dh_plane = torch.matmul(dh_plane, global_queries).reshape(bs, 200, 16, -1).unsqueeze(2) # bs, 200 16, 256
+            wh_plane = torch.matmul(wh_plane, global_queries).reshape(bs, 200, 16, -1).unsqueeze(1) # bs, 200 16, 256
+
+            dw_plane = dw_plane.repeat(1, 1, 1, 16, 1)
+            dh_plane = dh_plane.repeat(1, 1, 200, 1, 1)
+            wh_plane = wh_plane.repeat(1, 200, 1, 1, 1)
+
+            occ_feat = (dw_plane + dh_plane + wh_plane) / 3
+
+            # dw_plane = torch.mean(dw_plane.reshape(bs, 200, 200, Ncam, -1), dim=-2).unsqueeze(-2) # bs, 200, 200, Nqueries
+            # dh_plane = torch.mean(dh_plane.reshape(bs, 200, 16, Ncam, -1), dim=-2).unsqueeze(2) # bs, 200, 16, Nqueries
+            # wh_plane = torch.mean(wh_plane.reshape(bs, 200, 16, Ncam, -1), dim=-2).unsqueeze(1) # bs, 200, 16, Nqueries
+
+            # dw_plane = dw_plane.reshape(bs, 200, 200, -1).unsqueeze(-2) # bs, 200, 200, Nqueries
+            # dh_plane = dh_plane.reshape(bs, 200, 16, -1).unsqueeze(2) # bs, 200, 16, Nqueries
+            # wh_plane = wh_plane.reshape(bs, 200, 16, -1).unsqueeze(1) # bs, 200, 16, Nqueries
+            # occ_feat = dw_plane * dh_plane * wh_plane
+            # occ_feat = occ_feat / (occ_feat.max() + 1e-8)
+            # print(occ_feat)
+            # print(occ_feat.max().item())
+            # print(occ_feat.mean().item())
+            # print(occ_feat.min().item())
+
+            # threshold = 0.5
+            # mask = (occ_feat < threshold).all(dim=-1) # bs, D*W*H
+            # occ_feat[mask] = 0
+
+            # occ_feat = torch.matmul(occ_feat, general_queries) # bs, 200, 200, 16, C
+            # occ_feat = torch.matmul(occ_feat, global_queries.flatten(0,1).reshape(bs, -1, C)) # bs, 200, 200, 16, C
+
+            ###################################################################################
+            # zero_pad = torch.zeros(bs, 200, 200, 96, device='cuda')
+            # dw_plane = torch.cat([zero_pad, dw_plane], dim=-1)
             
-            occ_feat[mask] = 0 
-            occ_feat = occ_feat.reshape(bs, D, W, H, -1) # bs, D, W, H, 50
+            # zero_pad = torch.zeros(bs, 200, 16, 96, device='cuda')
+            # dh_plane = torch.cat([zero_pad, dh_plane], dim=-1)
+            # wh_plane = torch.cat([zero_pad, wh_plane], dim=-1)
+
+            # for i, index in enumerate(cart_idx):
+            #     d_indices = index[:, 0]
+            #     w_indices = index[:, 1]
+            #     h_indices = index[:, 2]
+            #     dw_plane[i, d_indices, w_indices] += inst_queries[i, :len(index)]
+            #     dh_plane[i, d_indices, h_indices] += inst_queries[i, :len(index)]
+            #     wh_plane[i, w_indices, h_indices] += inst_queries[i, :len(index)]
+
+            # dw_plane = self.fcn_dw_encoder(dw_plane.permute(0, 3, 1, 2)).permute(0, 2, 3, 1).unsqueeze(3)
+            # dh_plane = self.fcn_dh_encoder(dh_plane.permute(0, 3, 1, 2)).permute(0, 2, 3, 1).unsqueeze(2)
+            # wh_plane = self.fcn_wh_encoder(wh_plane.permute(0, 3, 1, 2)).permute(0, 2, 3, 1).unsqueeze(1)
+
+            # occ_feat = dw_plane * dh_plane * wh_plane
+            # bs, D, W, H, _ = occ_feat.shape
+            # input_reshaped = occ_feat.view(bs, D * W * H, C)  # bs, D*W*H, C
+            # query_reshaped = general_queries.t()  # C, N
+            # occ_feat = torch.bmm(input_reshaped, query_reshaped.unsqueeze(0).expand(bs, -1, -1))  # bs, D*W*H, N
+            # # occ_feat = occ_feat.view(bs, D, W, H, -1).sigmoid()
+            
+            # occ_feat = F.softmax(occ_feat, dim=-1)
+            # threshold = 0.5
+            # mask = (occ_feat < threshold).all(dim=-1) # bs, D*W*H
+
+            # # occ_feat[mask] = 0
+            # occ_feat = occ_feat.reshape(bs, D, W, H, -1) # bs, D, W, H, 50
             return_map['sparse_feat'] = occ_feat
-            return_map['sparse_idx'] = None
+            return_map['sparse_idx'] = None #~mask
+            ##################################################################################
 
             # occ_index = [] # [bs][N][3] occupied voxel indexes
             # max_len = 0
@@ -618,11 +784,12 @@ class FBOCC(CenterPoint):
             dict: Losses of different branches.
         """
 
-
+        # t = time.time()
         results= self.extract_feat(
             points, img=img_inputs, img_metas=img_metas, **kwargs)
         losses = dict()
-
+        # print(f"Model Calc Time: {time.time()-t}")
+        # t = time.time()
         if  self.with_pts_bbox:
             losses_pts = self.forward_pts_train(results['img_bev_feat'], gt_bboxes_3d,
                                             gt_labels_3d, img_metas,
@@ -640,7 +807,7 @@ class FBOCC(CenterPoint):
         if self.use_depth_supervision and self.with_specific_component('depth_net'):
             loss_depth = self.depth_net.get_depth_loss(kwargs['gt_depth'], results['depth'])
             losses.update(loss_depth)
-
+        # print(f"loss Calc Time: {time.time()-t}")
         return losses
 
     def forward_test(self,

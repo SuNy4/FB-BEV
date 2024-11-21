@@ -1,4 +1,5 @@
 import torch
+from torch.profiler import profile, ProfilerActivity
 import torch.nn as nn
 import torch.nn.functional as F
 import numpy as np
@@ -76,16 +77,16 @@ def KL_sep(p, target):
 
 
 def geo_scal_loss(pred, ssc_target, ignore_index=255, non_empty_idx=0, binary=False):
-
+    # pred = pred.to('cpu')
+    # ssc_target = ssc_target.to('cpu')
     # Get softmax probabilities
     # pred = F.softmax(pred, dim=1)
-
     # Compute empty and nonempty probabilities
     if binary:
         nonempty_probs = pred
         empty_probs = 1 - nonempty_probs
     else:
-        # pred = F.softmax(pred, dim=1)
+        pred = F.softmax(pred, dim=1)
         empty_probs = pred[:, non_empty_idx]
         nonempty_probs = 1 - empty_probs
 
@@ -101,26 +102,30 @@ def geo_scal_loss(pred, ssc_target, ignore_index=255, non_empty_idx=0, binary=Fa
     precision = intersection / (nonempty_probs.sum()+eps)
     recall = intersection / (nonempty_target.sum()+eps)
     spec = ((1 - nonempty_target) * (empty_probs)).sum() / ((1 - nonempty_target).sum()+eps)
-    with autocast(False):
-        return (
+    output = (
             F.binary_cross_entropy_with_logits(inverse_sigmoid(precision, 'A'), torch.ones_like(precision))
             + F.binary_cross_entropy_with_logits(inverse_sigmoid(recall, 'B'), torch.ones_like(recall))
             + F.binary_cross_entropy_with_logits(inverse_sigmoid(spec, 'C'), torch.ones_like(spec))
         )
+
+    # output = output.to('cuda')
+    with autocast(False):
+        return output
 
 
 
 def sem_scal_loss(pred, ssc_target, ignore_index=255):
     # Get softmax probabilities
     with autocast(False):
-        # pred = F.softmax(pred_, dim=1)
+        pred = F.softmax(pred, dim=1)
+        # pred = pred.to('cpu')
+        # ssc_target = ssc_target.to('cpu')
         loss = 0
         count = 0
         mask = ssc_target != ignore_index
         n_classes = pred.shape[1]
         begin = 1 if n_classes == 18 else 0
         for i in range(begin, n_classes):   
-
             # Get probability of class i
             p = pred[:, i]  
 
@@ -133,25 +138,32 @@ def sem_scal_loss(pred, ssc_target, ignore_index=255):
             completion_target[target != i] = 0
             completion_target_ori = torch.ones_like(target_ori).float()
             completion_target_ori[target_ori != i] = 0
-            if torch.sum(completion_target) > 0:
+            completion_target_sum = torch.sum(completion_target)
+
+            if completion_target_sum.item() > 0:
                 count += 1.0
                 nominator = torch.sum(p * completion_target)
                 loss_class = 0
-                if torch.sum(p) > 0:
-                    precision = nominator / (torch.sum(p)+ 1e-5)
+                
+                p_sum = torch.sum(p)
+                if p_sum.item() > 0:
+                    precision = nominator / (p_sum + 1e-5)
                     loss_precision = F.binary_cross_entropy_with_logits(
                             inverse_sigmoid(precision, 'D'), torch.ones_like(precision)
                         )
                     loss_class += loss_precision
-                if torch.sum(completion_target) > 0:
-                    recall = nominator / (torch.sum(completion_target) +1e-5)
+
+                if completion_target_sum.item() > 0:
+                    recall = nominator / (completion_target_sum +1e-5)
                     # loss_recall = F.binary_cross_entropy(recall, torch.ones_like(recall))
 
                     loss_recall = F.binary_cross_entropy_with_logits(inverse_sigmoid(recall, 'E'), torch.ones_like(recall))
                     loss_class += loss_recall
-                if torch.sum(1 - completion_target) > 0:
+
+                reverse_sum = torch.sum(1 - completion_target)
+                if reverse_sum.item() > 0:
                     specificity = torch.sum((1 - p) * (1 - completion_target)) / (
-                        torch.sum(1 - completion_target) +  1e-5
+                        reverse_sum +  1e-5
                     )
 
                     loss_specificity = F.binary_cross_entropy_with_logits(
@@ -161,6 +173,7 @@ def sem_scal_loss(pred, ssc_target, ignore_index=255):
                 loss += loss_class
                 # print(i, loss_class, loss_recall, loss_specificity)
         l = loss/count
+        # l = l.to('cuda')
         if torch.isnan(l):
             from IPython import embed
             embed()
