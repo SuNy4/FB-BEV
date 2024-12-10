@@ -33,7 +33,7 @@ class TransformerLayer(nn.Module):
             nn.Linear(out_dims * mlp_ratio, embed_dims),
         )
 
-    def forward(self, query, key=None, value=None, query_pos=None, key_pos=None):
+    def forward(self, query, key=None, value=None, query_pos=None, key_pos=None, pos_attn=False, attn_mask=None):
         # Query: bs, N, C
         if key is None and value is None:
             key = value = query
@@ -44,14 +44,24 @@ class TransformerLayer(nn.Module):
         # query = 
 
         if query_pos is not None:
-            query = query + self.attn(self.norm1(query) + query_pos, key, value)[0]
+            query = query + self.norm1(self.attn(query + query_pos, key, value, attn_mask=attn_mask)[0])
             weights = None
+        elif pos_attn:
+            attn_results = self.attn(query, key, value, attn_mask=attn_mask)[0]
+            # query = query + attn_results
+            nan_mask = torch.isnan(attn_results)
+            attn_results[nan_mask] = 0
+            return attn_results
         else:
-            attn_results, weights = self.attn(query, key, value, need_weights=True)
+            attn_results, weights = self.attn(query, key, value, need_weights=True, attn_mask=attn_mask)
             query = self.norm1(query + attn_results)
+            nan_mask = torch.isnan(query)
+            query[nan_mask] = 0
         if not hasattr(self, 'ffn'):
             return query
         query = self.norm2(query + self.ffn(query))
+        nan_mask = torch.isnan(query)
+        query[nan_mask] = 0
         return query, weights
 
 
@@ -310,6 +320,9 @@ class DeformableTransformerLayer(nn.Module):
             ref_pts = ref_pts.unsqueeze(2).repeat(1, 1, self.num_levels, 1)[..., :2]
 
         if occ_value:
+            ref_pts = ref_pts.unsqueeze(2).repeat(1, 1, self.num_levels, 1)
+
+        else:
             ref_pts = ref_pts.unsqueeze(2).repeat(1, 1, self.num_levels, 1)
             
         query = query + self.attn(

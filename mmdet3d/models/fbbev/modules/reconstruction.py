@@ -14,7 +14,10 @@ import math
 class SphericalPositionalEncodingWithView(torch.nn.Module):
     def __init__(self, max_radius=40, num_freqs=8):
         super(SphericalPositionalEncodingWithView, self).__init__()
-        self.freq_bands = 2.0 ** torch.linspace(0, num_freqs - 1, num_freqs).cuda()
+        # self.freq_bands_r = 2.0 ** torch.linspace(0, num_freqs - 1, num_freqs).cuda()
+        # self.freq_bands_theta = 2.0 ** torch.linspace(0, num_freqs - 1, num_freqs).cuda()
+        # self.freq_bands_phi = 2.0 ** torch.linspace(-4, num_freqs - 5, num_freqs).cuda()
+        self.freq_bands = ((2.0 ** torch.linspace(-3, num_freqs - 4, num_freqs))).cuda()
     
     def forward(self, coords): # img_encode=False, encode_theta=False, theta_only=False):
         """
@@ -28,11 +31,17 @@ class SphericalPositionalEncodingWithView(torch.nn.Module):
         x_list = []
         for i in range(coords.shape[-1]):
             x = coords[..., i]
+            x_max = x.max()
+            x_min = x.min()
+            x = 2 * (x-x_min) / (x_max-x_min + 1e-8) -1
             x = torch.cat([torch.sin(self.freq_bands[None, None, None, :] * x[..., None]),
                             torch.cos(self.freq_bands[None, None, None, :] * x[..., None])], dim=-1)
             x_list.append(x)
-        
+
         pos_enc = torch.cat(x_list, dim=-1).cuda()
+
+        # x = torch.cat([torch.sin(self.freq_bands[None, None, None, :] * coords[..., None]),
+        #                     torch.cos(self.freq_bands[None, None, None, :] * coords[..., None])], dim=-1)
 
         # if theta_only:
         #     theta = coords[..., 1]
@@ -477,7 +486,7 @@ class _ASPPModule(nn.Module):
                 m.weight.data.fill_(1)
                 m.bias.data.zero_()
 
-
+@NECKS.register_module()
 class ASPP(nn.Module):
     def __init__(self, inplanes, mid_channels=256, BatchNorm=nn.BatchNorm2d):
         super(ASPP, self).__init__()
@@ -638,7 +647,8 @@ class CamPosEncoder(nn.Module):
                 u, v = torch.meshgrid(u, v, indexing='ij')
                 img_grid = torch.stack([u, v], dim=-1).flatten(0, 1)
                 img_grid = img_grid[None, None, :].repeat(bs, Ncam, 1, 1)
-
+            
+            input_grid = img_grid.clone()
             img_grid[..., 0] *= (self.original_dim[1]/W)
             img_grid[..., 1] *= (self.original_dim[0]/H)
 
@@ -656,7 +666,7 @@ class CamPosEncoder(nn.Module):
         #     target_per_batch = self.encoder(target[i], img_encode=True)
         #     target_list.append(target_per_batch.unsqueeze(0))
         # target = torch.cat(target_list, dim=0).reshape(bs, Ncam, H, W, -1)
-        if custum_input:
-            return pos_encode, sph_coord 
+        if custum_input or mode=='Global':
+            return pos_encode, input_grid, sph_coord 
         
         return pos_encode

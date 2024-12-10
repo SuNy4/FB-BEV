@@ -6,9 +6,9 @@
 
 
 # we follow the online training settings  from solofusion
-num_gpus = 2
+num_gpus = 1
 samples_per_gpu = 2
-num_iters_per_epoch = int(28130 // (num_gpus * samples_per_gpu) * 4.554) # single_scene: 120, whole_scene: 28130, half_scene: 13979
+num_iters_per_epoch = int(161 // (num_gpus * samples_per_gpu) * 4.554) # single_scene: 120, whole_scene: 28130, half_scene: 13979
 num_epochs = 20
 checkpoint_epoch_interval = 1
 use_custom_eval_hook = True
@@ -19,7 +19,7 @@ use_custom_eval_hook = True
 # lowering performance. To increase diversity, we split each training sequence
 # in half to ~20 keyframes, and sample these shorter sequences during training.
 # During testing, we do not do this splitting.
-train_sequences_split_num = 2
+train_sequences_split_num = 4
 test_sequences_split_num = 1
 
 # By default, 3D detection datasets randomly choose another sample if there is
@@ -79,6 +79,8 @@ grid_config = {
     'x': [-40, 40, 0.8],
     'y': [-40, 40, 0.8],
     'z': [-1, 5.4, 0.8],
+    'radius':[0, 40, 100], # radius range: 0~40, how many steps: 100
+    'shape': [200, 200, 16],
     'depth': [2.0, 42.0, 0.5],
     'Cam_Setting': [55, 0, -55, -100, 180, 100] # Front Left ~ Back Left cam angle in degrees 110 -> 100
 }      
@@ -96,15 +98,17 @@ occ_h = 8
 numC_Trans=80
 back_dim_=256
 fcn_dim_ = 512
-_dim_ = 128
+_dim_ = 256
+pos_encode_freq = 16
+
 _pos_dim_ = 40
 _ffn_dim_ = numC_Trans * 4
-_num_heads_ = 8
-_num_levels_= 2
+_num_heads_ = 4
+_num_levels_= 3
 _num_queries_=100
 
 empty_idx = 0  # free class
-num_cls = 18  # 1-17 obj, 0 free
+num_cls = 17  # 1-17 obj, 0 free
 fix_void = True
 img_norm_cfg = None
 
@@ -112,21 +116,25 @@ occ_size = [200, 200, 16]
 voxel_out_indices = (0, 1, 2)
 voxel_out_channel = 256
 voxel_channels = [64, 64*2, 64*4]
-freeze_depthnet_components = False
+freeze_depthnet_components = True
 model = dict(
-    type='FBOCC',
+    type='QBON_v3',
     use_depth_supervision=False,
     fix_void=fix_void,
     do_history = do_history,
     #history_cat_num=history_cat_num,
     single_bev_num_channels=numC_Trans,
     readd=True,
+    pos_freq=pos_encode_freq,
     embed_dim=_dim_,
+    N_global_queries=_num_queries_,
     attn_level=_num_levels_,
     grid_config = grid_config,
+    num_head = _num_heads_,
+    N_points = 50,
 
     img_backbone=dict(
-        #pretrained='./ckpts/r50_256x705_depth_pretrain.pth',
+        pretrained='./ckpts/r50_256x705_depth_pretrain.pth',
         type='ResNet',
         depth=50,
         num_stages=4,
@@ -148,76 +156,110 @@ model = dict(
         out_ids=[0]
     ),
 
-    cam_pos_encoder=dict(
+    pos_encoder=dict(
         type='CamPosEncoder',
         data_config = data_config,
-        num_freqs = 10,
+        num_freqs = pos_encode_freq,
     ),
 
-    # cam_feat_encoder=dict(
-    #     type='CamFeatEncoder',
-    #     in_channel=back_dim_+ 40, # Must be _dim_ + 4*num_freqs in cam pos encoder
-    #     out_channel=_dim_,
-    # ),
+    aspp_layer=dict(
+        type='ASPP',
+        inplanes=_dim_+ 4 * pos_encode_freq,
+        mid_channels=_dim_
+    ),
 
-    back_project=dict(
-        type='PosDeformableTransformerLayer',
+    img_deform_self_attn=dict(
+        type='DeformableTransformerLayer',
         embed_dims=_dim_,
-        mlp_ratio=2,
         num_heads=_num_heads_,
         num_levels=1,
         num_points=8,
+        attn_layer='MultiScaleDeformableAttention', # DeformableSqueezeAttention for 3D attention, MultiScaleDeformableAttention for 2D
         grid_config=grid_config,
         data_config=data_config,
     ),
 
-    # voxel_self_attn = dict(
+    # img_query_cross_attn=dict(
+    #     type='TransformerLayer',
+    #     embed_dims=_dim_,
+    #     # out_dims=_dim_+(pos_encode_freq*4),
+    #     num_heads=_num_heads_,
+    #     mlp_ratio=2
+    # ),
+    
+    query_img_cross_attn=dict(
+        type='DeformableTransformerLayer',
+        embed_dims=_dim_,
+        num_heads=_num_heads_,
+        num_levels=1,
+        num_points=8,
+        attn_layer='MultiScaleDeformableAttention', # DeformableSqueezeAttention for 3D attention, MultiScaleDeformableAttention for 2D
+        grid_config=grid_config,
+        data_config=data_config,
+    ),
+
+    query_self_attn_local=dict(
+        type='TransformerLayer',
+        embed_dims=_dim_,
+        num_heads=_num_heads_,
+        mlp_ratio=2
+    ),
+
+    query_self_attn_global=dict(
+        type='TransformerLayer',
+        embed_dims=_dim_,
+        # out_dims=_dim_+(pos_encode_freq*4),
+        num_heads=_num_heads_,
+        mlp_ratio=2
+    ),
+
+    # global_pos_self_attn_L2=dict(
+    #     type='TransformerLayer',
+    #     embed_dims=_dim_,
+    #     num_heads=_num_heads_,
+    #     mlp_ratio=2
+    # ),
+    
     #     type='TransformerLayer',
     #     embed_dims=_dim_,
     #     num_heads=_num_heads_,
     #     mlp_ratio=2
     # ),
 
-    # voxel_self_attn=dict(
-    #     type='PosDeformableTransformerLayer',
-    #     embed_dims=_dim_,
-    #     mlp_ratio=2,
-    #     num_heads=_num_heads_,
-    #     num_levels=1,
-    #     num_points=5,
-    #     attn_layer='DeformableSqueezeAttention',
-    #     grid_config=grid_config,
-    #     data_config=data_config,
-    # ),
-
-    bev_fcn_encoder=dict(
-        type='BEV2DFCN',
-        flatten_height=True,
-        height=occ_h,
-        in_channels = _dim_ + 32,
-        mid_channels= fcn_dim_,
-        out_channels = _dim_,
-    ),
-
-    # sparse_conv_encoder = dict(
-    #     type='Sparse',
+    # map_query_attn=dict(
+    #     type='TransformerLayer',
     #     embed_dims=_dim_,
     #     num_heads=_num_heads_,
     #     mlp_ratio=2
     # ),
-    
-    geometry_head = dict(
-        type = 'MLPGeometryHead',
-        input_channels = _dim_,
-        threshold = 0.7
-    ),
 
-    inst_lvl_self_attn = dict(
-        type='TransformerLayer',
-        embed_dims=_dim_,
-        num_heads=_num_heads_,
-        mlp_ratio=2
-    ),
+    # fcn_dw_encoder=dict(
+    #     type='BEV2DFCN',
+    #     flatten_height=False,
+    #     height=occ_h,
+    #     in_channels = None,
+    #     mid_channels= _dim_,
+    #     h_level=[4, 8, 16],
+    #     out_channels = _dim_,
+    # ),
+
+    # fcn_dh_encoder=dict(
+    #     type='BEV2DFCN',
+    #     flatten_height=False,
+    #     height=occ_h,
+    #     in_channels = None,
+    #     mid_channels= _dim_,
+    #     out_channels = _dim_,
+    # ),
+
+    # fcn_wh_encoder=dict(
+    #     type='BEV2DFCN',
+    #     flatten_height=False,
+    #     height=occ_h,
+    #     in_channels = None,
+    #     mid_channels= _dim_,
+    #     out_channels = _dim_,
+    # ),
 
     backward_projection=None,
 
@@ -236,10 +278,12 @@ model = dict(
         point_cloud_range=point_cloud_range,
         loss_weight_cfg=dict(
             loss_cos_sim_weight=1.0,
-            loss_voxel_ce_weight=0.2,
+            loss_voxel_ce_weight=0.5,
             loss_voxel_sem_scal_weight=1.0,
-            loss_voxel_geo_scal_weight=0.5,
+            loss_voxel_geo_scal_weight=2.0,
             loss_voxel_lovasz_weight=1.0,
+            loss_feature_alignment_weight=1.0,
+            loss_query_div_weight=1.0,
         ),
     ),
     pts_bbox_head=None)
@@ -329,7 +373,7 @@ share_data_config = dict(
 test_data_config = dict(
     pipeline=test_pipeline,
     sequences_split_num=test_sequences_split_num,
-    ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl')#'bevdetv2-nuscenes_infos_val.pkl')# 'bevdetv2-nuscenes_infos_val.pkl')
+    ann_file=data_root + 'overfit-nuscenes_infos.pkl')#'bevdetv2-nuscenes_infos_val.pkl')# overfit-nuscenes_infos.pkl
 
 data = dict(
     samples_per_gpu=samples_per_gpu,
@@ -338,7 +382,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'bevdetv2-nuscenes_infos_train.pkl',#'bevdetv2-nuscenes_infos_train.pkl', # half_scene_train.pkl, single_scene_overfit.pkl
+        ann_file=data_root + 'overfit-nuscenes_infos.pkl',#'bevdetv2-nuscenes_infos_train.pkl', # half_scene_train.pkl, overfit-nuscenes_infos.pkl
         pipeline=train_pipeline,
         classes=class_names,
         test_mode=False,
@@ -358,16 +402,17 @@ for key in ['val', 'test']:
     data[key].update(share_data_config)
 
 # Optimizer
-lr = 2e-4
-optimizer = dict(type='AdamW', lr=lr, weight_decay=1e-2)
- 
+lr = 5e-4
+optimizer = dict(type='AdamW', lr=lr, weight_decay=0.01)
+
 optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
 lr_config = dict(
     policy='step',
     warmup='linear',
-    warmup_iters=200,
-    warmup_ratio=0.001,
-    step=[num_iters_per_epoch*num_epochs,])
+    warmup_iters=num_iters_per_epoch,
+    warmup_ratio=0.01,
+    step=[num_iters_per_epoch * 4, num_iters_per_epoch * 8, num_iters_per_epoch * 12],
+    gamma=0.8)
 runner = dict(type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
 checkpoint_config = dict(
     interval=checkpoint_epoch_interval * num_iters_per_epoch)
@@ -392,5 +437,5 @@ custom_hooks = [
         temporal_start_iter=num_iters_per_epoch *2,
     ),
 ]
-load_from = './ckpts/depthnet_pretrained.pth' #'work_dirs/sparse_pos/iter_25620.pth'#'test/occlusion_1st/iter_85340.pth' #/home/sungjin/codes/FB-BEV/work_dirs/FIOcc/iter_800.pth'
+# load_from = './ckpts/depthnet_pretrained.pth' #'work_dirs/sparse_pos/iter_25620.pth'#'test/occlusion_1st/iter_85340.pth' #/home/sungjin/codes/FB-BEV/work_dirs/FIOcc/iter_800.pth'
 #fp16 = dict(loss_scale='dynamic')

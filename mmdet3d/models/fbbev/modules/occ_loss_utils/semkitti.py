@@ -216,6 +216,88 @@ def vel_loss(pred, gt):
     with autocast(False):
         return F.l1_loss(pred, gt)
 
+def chamfer_distance_loss(pred, gt):
+    # gt: bs, D, W, H
+    # Expand dims for pairwise distance computation
+    
+    bs = gt.shape[0]
+    
+    
+    # batch_indices = gt[:, 0]
+    # gt_indices = gt[:, 1:]
+    
+    # gt_expand = [gt_indices[batch_indices == i].unsqueeze(0) for i in range(bs)] # bs[1, N_ture, 3]
+    
+    pred_expand = pred.unsqueeze(2)  # (bs, Npred, 1, 3)
+    
+    # Pairwise L2 distances
+    total_dist = 0
+    for i in range(bs):
+        gt_expand = torch.nonzero(gt[i]).unsqueeze(0) # Ntrue, 3
+        distances = torch.cdist(pred_expand[i] - gt_expand, p=1)  # Npred, Ntrue
+
+        # For each point in pred, find closest point in gt
+        pred_to_gt = torch.min(distances, dim=-1)[0]  # (Npred)
+        gt_to_pred = torch.min(distances, dim=-2)[0]  # (Ntrue)
+
+        # Mean of the bidirectional distances
+        chamfer_dist = pred_to_gt.mean() + gt_to_pred.mean()
+        total_dist += chamfer_dist
+    
+    total_dist /= bs
+
+    return total_dist
+
+
+def hard_feature_query_alignment_loss(features, queries, mask):
+    features = F.normalize(features, dim=-1) # bsNcam, HW, C
+    queries = F.normalize(queries, dim=-1) # bsNcam, N, C
+    mask = ~mask.unsqueeze(-1) # bsNcam, N
+
+    similarity_scores = torch.matmul(queries, features.transpose(-1, -2)) # bsNcam, N, HW
+    similarity_scores = (similarity_scores + 1) / 2
+    similarity_scores = similarity_scores * mask
+
+    max_indices = similarity_scores.argmax(dim=-1)  # bsNcam, N
+
+    selected_features = torch.gather(
+        features, dim=1,
+        index=max_indices.unsqueeze(-1).expand(-1, -1, features.size(-1))
+    ) # bsNcam, N, C
+    
+    selected_features = selected_features * mask
+    queries = queries * mask
+
+    loss = F.mse_loss(selected_features, queries)
+    # print(f'hard_align_loss: {loss}')
+    return loss
+
+def feature_query_reconstruction_loss(features, queries):
+    features = F.normalize(features, dim=-1) # bsNcam, HW, C
+    queries = F.normalize(queries, dim=-1) # bsNcam, N, C
+
+    similarity_scores = torch.matmul(features, queries.transpose(-1, -2)) # bsNcam, HW, N
+
+    attention_weights = F.softmax(similarity_scores, dim=-1) # bsNcam, HW, N 
+
+    reconstructed_features = torch.matmul(attention_weights, queries) # bsNcam, HW, C
+
+    align_loss = F.mse_loss(reconstructed_features, features)
+    return align_loss
+
+def query_diversity_loss(queries, mask):
+    queries = F.normalize(queries, dim=-1) # bsNcam, N, C
+    mask = ~mask.unsqueeze(-1) # bsNcam, N
+    dot_products = torch.matmul(queries, queries.transpose(-1, -2)) # bsNcam, N, N
+
+    identity = torch.eye(dot_products.size(-1), device=dot_products.device)
+    dot_products = dot_products - identity.unsqueeze(0) # bsNcam, N, N # -1~1 range
+    dot_products = (dot_products + 1) / 2
+    dot_products = dot_products * mask # bsNcam, N, N
+
+    diversity_loss = dot_products.abs().mean()
+    # print(f'diversity_loss: {diversity_loss}')
+    return diversity_loss
 
 def cos_sim_loss(pred):
     cos_sim_list = []

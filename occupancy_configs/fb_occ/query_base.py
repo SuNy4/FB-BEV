@@ -79,6 +79,7 @@ grid_config = {
     'x': [-40, 40, 0.8],
     'y': [-40, 40, 0.8],
     'z': [-1, 5.4, 0.8],
+    'shape': [200, 200, 16],
     'depth': [2.0, 42.0, 0.5],
     'Cam_Setting': [55, 0, -55, -100, 180, 100] # Front Left ~ Back Left cam angle in degrees 110 -> 100
 }      

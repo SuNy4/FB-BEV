@@ -15,7 +15,7 @@ from mmcv.cnn import build_conv_layer, build_norm_layer, build_upsample_layer
 from mmdet3d.models.fbbev.modules.occ_loss_utils import lovasz_softmax, CustomFocalLoss
 from mmdet3d.models.fbbev.modules.occ_loss_utils import nusc_class_frequencies, nusc_class_names
 from mmdet3d.models.fbbev.modules.occ_loss_utils import geo_scal_loss, sem_scal_loss, CE_ssc_loss, BCE_ssc_loss, cos_sim_loss,\
-                                                        hard_feature_query_alignment_loss, feature_query_reconstruction_loss, query_diversity_loss, chamfer_distance_loss
+                                                        hard_feature_query_alignment_loss, feature_query_reconstruction_loss, query_diversity_loss
 from torch.utils.checkpoint import checkpoint as cp
 from mmcv.runner import BaseModule, force_fp32
 from torch.cuda.amp import autocast
@@ -230,28 +230,11 @@ class OccHead(BaseModule):
 
     @force_fp32()
     def forward_sparse(self, feats=None, sparse_idx=None, **kwargs):
-        # sparse feats: bs, Ncam*Nqueries, C
-        # sparse idx: bs, Ncam*Nqueries, N_pts, 3
-        bs, _, N_pts, _ = sparse_idx.shape
-        sparse_idx = sparse_idx.permute(1, 0, 2, 3) # sparse idx: Ncam*Nqueries, bs, N_pts, 3
-        
-        feats = feats.permute(0, 2, 1) # bs, C, N
-        feats = self.mlphead(feats).permute(0, 2, 1) # bs, Ncam*N_queries, N_Classes
-        feats = feats.unsqueeze(2).repeat(1, 1, N_pts, 1)
-
-        map = torch.zeros(bs, 200, 200, 16, 17).to(feats.device)
-        empty = torch.zeros(bs, 200, 200, 16, 1).to(feats.device)
-
-        batch_indices = torch.arange(bs, device=feats.device).view(-1, 1)
-
-        for j, idx in enumerate(sparse_idx):
-            # map.scatter_add_(0, torch.stack((batch_indices, idx[..., 0], idx[..., 1], idx[..., 2]), dim=0), feats[:, j])
-            map[batch_indices, idx[..., 0], idx[..., 1], idx[..., 2]] = feats[:, j]
-
-        empty[(map == 0).all(dim=-1)] = 1
-
-        map = torch.cat([empty, map], dim=-1).permute(0, 4, 1, 2, 3) # bs, C, D, W, H
-
+        # sparse feats: bs, D, W, H, C // bs, N
+        # sparse idx: bs, DWH
+        bs, D, W, H, _ = feats.shape
+        feats = feats.flatten(start_dim=1, end_dim=3).permute(0, 2, 1) # bs, C, DWH
+        feats = self.mlphead(feats).reshape(bs, -1, D, W, H) # bs, classes, D, W, H
         # feats = torch.softmax(feats, dim=1)
         ########################################################
         # sparse_feats = [feats[i, sparse_idx[i]] for i in range(bs)]
@@ -286,7 +269,7 @@ class OccHead(BaseModule):
         
 
         res = {
-            'output_voxels': [map],  ## bs, C, D, W, H
+            'output_voxels': [feats],  ## bs, C, D, W, H
             'output_voxels_fine': None,
             'output_coords_fine': None,
         }
@@ -329,13 +312,13 @@ class OccHead(BaseModule):
 
     @force_fp32() 
     def loss_voxel(self, output_voxels, target_voxels, cam_mask, tag, **kwargs):
-        # target_voxels: bs, D, W, H
+        
         # kwargs['results']['geom'] = F.interpolate(kwargs['results']['geom'].unsqueeze(1), scale_factor=2, mode='trilinear', align_corners=False).squeeze(1)
         # kwargs['results']['pred_cam_mask'] = F.interpolate(kwargs['results']['pred_cam_mask'].unsqueeze(1), scale_factor=2, mode='trilinear', align_corners=False).squeeze(1)
+
         # resize gt                       
         B, C, H, W, D = output_voxels.shape
         ratio = target_voxels.shape[2] // H
-
         if ratio != 1:
             target_voxels = target_voxels.reshape(B, H, ratio, W, ratio, D, ratio).permute(0,1,3,5,2,4,6).reshape(B, H, W, D, ratio**3)
             empty_mask = target_voxels.sum(-1) == self.empty_idx
@@ -371,9 +354,9 @@ class OccHead(BaseModule):
         # loss_dict['loss_voxel_geo_scal_cam_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['pred_cam_mask'], cam_mask, ignore_index=255, non_empty_idx=0, binary=True) #\
                                                            #+ self.loss_cos_sim_weight * cos_sim_loss(kwargs['results']['overlapped_pair'])
         # loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['geom'], target_voxels, ignore_index=255, non_empty_idx=0, binary=True)
-        # loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=0)
+        loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=0)
                                                         #+ 0.1* self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['geom'], target_voxels, ignore_index=255, non_empty_idx=0, binary=True))/2
-        loss_dict['chamfer_dist_loss_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * chamfer_distance_loss(kwargs['results']['geometry'], target_voxels)
+        
         loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = self.loss_voxel_sem_scal_weight * sem_scal_loss(output_voxels, target_voxels, ignore_index=0) # Check only 1~17 classes
 
         # loss_dict['query_loss_{}'.format(tag)] = self.loss_feature_alignment_loss * hard_feature_query_alignment_loss(kwargs['results']['feature_map'], kwargs['results']['global_queries'])

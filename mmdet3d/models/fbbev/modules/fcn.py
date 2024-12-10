@@ -42,14 +42,18 @@ class UpsampleLayer(nn.Module):
 
 @NECKS.register_module()
 class BEV2DFCN(nn.Module):
-    def __init__(self, flatten_height, height, in_channels, mid_channels, out_channels):
+    def __init__(self, flatten_height, height, in_channels, mid_channels, h_level, out_channels=None):
         super(BEV2DFCN, self).__init__()
+        self.h_level = h_level
         self.flatten_height = flatten_height
         self.conv0 = nn.Conv2d(in_channels*height, mid_channels, kernel_size=3, stride=1, padding=1) if self.flatten_height else None
-        self.conv1 = nn.Conv1d(mid_channels, out_channels, kernel_size=1)
+        self.conv_1 = nn.Conv1d(mid_channels, mid_channels*h_level[0], kernel_size=1)
+        self.conv_2 = nn.Conv1d(mid_channels*h_level[0], mid_channels*h_level[1], kernel_size=1)
+        self.conv_3 = nn.Conv1d(mid_channels*h_level[1], mid_channels*h_level[2], kernel_size=1)
         self.conv2 = nn.Conv1d(mid_channels, height, kernel_size=1) if self.flatten_height else None
         self.bn_flat0 = nn.BatchNorm2d(mid_channels) if self.flatten_height else None
-        self.bn_flat1 = nn.BatchNorm2d(out_channels)
+        self.bn_flat_1 = nn.BatchNorm1d(mid_channels*h_level[0])
+        self.bn_flat_2 = nn.BatchNorm1d(mid_channels*h_level[1])
         self.bn_flat2 = nn.BatchNorm2d(height) if self.flatten_height else None
         self.gelu = nn.GELU()
         self.encoder1 = nn.Conv2d(mid_channels, mid_channels*2, kernel_size=4, stride=2, padding=1)
@@ -85,14 +89,16 @@ class BEV2DFCN(nn.Module):
         out = d2 + x
         bs, _, D, W = out.shape
 
-        feat_out = self.gelu(self.bn_flat1(self.conv1(out.flatten(2, 3)))).reshape(bs, -1, D, W) # bs, C, D, W
+        out = self.gelu(self.bn_flat_1(self.conv_1(out.flatten(2, 3)))) # bs, C, DW
+        out = self.gelu(self.bn_flat_2(self.conv_2(out)))
+        out = self.conv_3(out).reshape(bs, -1, D, W, self.h_level[2])
         if self.flatten_height:
             bev_h = self.gelu(self.bn_flat2(self.conv2(out.flatten(2, 3)))).reshape(bs, -1, D, W).permute(0, 2, 3, 1) # bs, H, D, W => bs, D, W, H
             bev_h = bev_h.sigmoid()
 
-            return feat_out, bev_h
+            return out, bev_h
         else:
-            return feat_out
+            return out
 
 ######## Original FCN2D ################
 # @NECKS.register_module()
