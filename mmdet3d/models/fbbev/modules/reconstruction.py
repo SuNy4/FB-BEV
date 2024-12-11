@@ -648,7 +648,7 @@ class CamPosEncoder(nn.Module):
                 img_grid = torch.stack([u, v], dim=-1).flatten(0, 1)
                 img_grid = img_grid[None, None, :].repeat(bs, Ncam, 1, 1)
             
-            input_grid = img_grid.clone()
+            input_grid = img_grid.clone() # img_grid: bs, Ncam, WH, 2
             img_grid[..., 0] *= (self.original_dim[1]/W)
             img_grid[..., 1] *= (self.original_dim[0]/H)
 

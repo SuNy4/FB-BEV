@@ -6,9 +6,9 @@
 
 
 # we follow the online training settings  from solofusion
-num_gpus = 1
-samples_per_gpu = 2
-num_iters_per_epoch = int(161 // (num_gpus * samples_per_gpu) * 4.554) # single_scene: 120, whole_scene: 28130, half_scene: 13979
+num_gpus = 3
+samples_per_gpu = 5
+num_iters_per_epoch = int(28130 // (num_gpus * samples_per_gpu) * 4.554) # single_scene: 120, whole_scene: 28130, half_scene: 13979
 num_epochs = 20
 checkpoint_epoch_interval = 1
 use_custom_eval_hook = True
@@ -79,7 +79,7 @@ grid_config = {
     'x': [-40, 40, 0.8],
     'y': [-40, 40, 0.8],
     'z': [-1, 5.4, 0.8],
-    'radius':[0, 40, 100], # radius range: 0~40, how many steps: 100
+    'radius':[2.0, 42.0, 100], # radius range: 0~40, how many steps: 100
     'shape': [200, 200, 16],
     'depth': [2.0, 42.0, 0.5],
     'Cam_Setting': [55, 0, -55, -100, 180, 100] # Front Left ~ Back Left cam angle in degrees 110 -> 100
@@ -119,7 +119,7 @@ voxel_channels = [64, 64*2, 64*4]
 freeze_depthnet_components = True
 model = dict(
     type='QBON_v3',
-    use_depth_supervision=False,
+    use_depth_supervision=True,
     fix_void=fix_void,
     do_history = do_history,
     #history_cat_num=history_cat_num,
@@ -134,7 +134,7 @@ model = dict(
     N_points = 50,
 
     img_backbone=dict(
-        pretrained='./ckpts/r50_256x705_depth_pretrain.pth',
+        pretrained='./ckpts/fbocc-r50-cbgs_depth_16f_16x4_20e.pth',
         type='ResNet',
         depth=50,
         num_stages=4,

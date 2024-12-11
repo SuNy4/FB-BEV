@@ -227,25 +227,36 @@ def chamfer_distance_loss(pred, gt):
     # gt_indices = gt[:, 1:]
     
     # gt_expand = [gt_indices[batch_indices == i].unsqueeze(0) for i in range(bs)] # bs[1, N_ture, 3]
-    
+
     pred_expand = pred.unsqueeze(2)  # (bs, Npred, 1, 3)
-    
     # Pairwise L2 distances
     total_dist = 0
-    for i in range(bs):
-        gt_expand = torch.nonzero(gt[i]).unsqueeze(0) # Ntrue, 3
-        distances = torch.cdist(pred_expand[i] - gt_expand, p=1)  # Npred, Ntrue
-
-        # For each point in pred, find closest point in gt
-        pred_to_gt = torch.min(distances, dim=-1)[0]  # (Npred)
-        gt_to_pred = torch.min(distances, dim=-2)[0]  # (Ntrue)
-
-        # Mean of the bidirectional distances
-        chamfer_dist = pred_to_gt.mean() + gt_to_pred.mean()
-        total_dist += chamfer_dist
     
-    total_dist /= bs
 
+    for i in range(bs):
+        gt_expand = torch.nonzero(gt[i]).float().to('cuda') # Ntrue, 3
+        
+        num_pred = pred_expand.shape[1]
+        num_gt = gt_expand.shape[1]
+        # pred: Npred, 1, 3
+        pred_to_gt = 0
+        gt_to_pred = 0 
+
+        for j in range(num_pred):
+            target_pred = pred_expand[i][j].unsqueeze(0) # 1, 1, 3
+            distances = torch.cdist(target_pred, gt_expand.unsqueeze(0), p=1)  # Npred, Ntrue
+            # For each point in pred, find closest point in gt
+            pred_to_gt = pred_to_gt + torch.min(distances, dim=-1)[0]  # (Npred)
+
+        for k in range(num_gt):
+            target_gt = gt_expand.unsqueeze(1)[k].unsqueeze(0) # 1, 1, 3
+            distances = torch.cdist(pred_expand[i], target_gt, p=1) # Npred, Ntrue
+            gt_to_pred = gt_to_pred + torch.min(distances, dim=0)[0]  # (Npred)
+
+        chamfer_dist = pred_to_gt/num_pred + gt_to_pred/num_gt
+        total_dist = total_dist + chamfer_dist
+    
+    total_dist = total_dist / bs
     return total_dist
 
 
@@ -311,60 +322,132 @@ def cos_sim_loss(pred):
     total_loss = torch.stack(cos_sim_list).mean()
     return total_loss
 
-    # pred: Ncam, bs, N, C
-    # idx: [bs][Ncam][N][3]
-    # camera_pairs = [(0, 1), (1, 2), (2, 3), (3, 4), (5, 0)]
-    # pair1 = [0, 2, 4]
-    # pair2 = [1, 3, 5]
-    # total_loss = 0.0
-    # max_len = pred.shape[2]
-    # index1 = torch.empty(3, max_len, 3).cuda()
-    # index2 = torch.empty(3, max_len, 3).cuda()
-    # feat_pair1 = pred[pair1]
-    # feat_pair2 = pred[pair2]
 
-    # _, bs, _, C = pred.shape
-    # voxel_map = []
+def radius_loss(gt, preds, pred_pixel_coords, cam_params):
+    # gt: bs, Ncam, ori_H, ori_W (gt depth for image)
+    # pred: bs*Ncam, N_queries, 100
+    # pred_pixel_coords: bs*Ncam, N_queries, 2
 
-    # for i, indices in enumerate(idx):
-    #     # NCam, Maxlen, C
-    #     feat1 = feat_pair1[:, i]
-    #     feat2 = feat_pair2[:, i]
+    radius_range = [2, 42, 0.4] # 100
+    radius_channels = preds.shape[-1]
 
-    #     # NCam, Maxlen, 3
-    #     for j, (cam1, cam2) in enumerate(zip(pair1, pair2)):
-    #         index1[j, :len(indices[cam1])] = indices[cam1]
-    #         index2[j, :len(indices[cam2])] = indices[cam2]
+    bs, Ncam, orig_H, orig_W = gt.shape
+    gt_downsample = get_downsampled_gt_depth(16, gt) #  bs, Ncam, W, H
+    _, _, W, H = gt_downsample.shape
 
-        # index1_expanded = index1.unsqueeze(2)  # (N, 1, 3)
-        # index2_expanded = index2.unsqueeze(1)  # (1, N, 3)
+    assert (orig_W // W) == (orig_H // H)
 
-        # common_mask = (index1_expanded == index2_expanded).all(dim=-1)
-        # print(common_mask.shape)
-        # overlap_indices = torch.nonzero(common_mask, as_tuple=False)
-        # print(overlap_indices.shape)
-        # overlap = index1[overlap_indices[:, 0]]
-        # print(overlap.shape)
-        # assert False
+    u = torch.linspace(0, W - 1, W, device=gt.device)
+    v = torch.linspace(0, H - 1, H, device=gt.device)
 
-        # set1 = set(map(tuple, index1.view(-1, 3).cpu().numpy()))
-        # set2 = set(map(tuple, index2.view(-1, 3).cpu().numpy()))
+    u, v = torch.meshgrid(u, v, indexing='ij')
+    img_grid = torch.stack([u, v], dim=-1).flatten(0, 1)
+    img_grid = img_grid[None, None, :].repeat(bs, Ncam, 1, 1)
+        
+    # img_grid: bs, Ncam, WH, 2
+    img_grid[..., 0] *= (orig_W/W)
+    img_grid[..., 1] *= (orig_H/H)
 
-        # overlap = set1.intersection(set2)
-        # # N, 3
-        # overlap = torch.tensor(list(overlap)).cuda()
+    gt_downsample = gt_downsample.flatten(2, 3).unsqueeze(-1)
+    img_grid = torch.cat([img_grid, gt_downsample], dim=-1) # bs, Ncam, WH, 3
 
-        # N, _ = overlap.shape
-        # # N, C
-        # overlap1 = torch.empty(N, C).cuda()
-        # overlap2 = torch.empty(N, C).cuda()
-
-        # for i, coord in enumerate(overlap):
-        #     if not torch.equal(coord, torch.tensor([0, 0, 0]).cuda()):
-
-        #         indice1 = torch.nonzero((index1[..., 0] == coord[0]) & (index1[..., 1] == coord[1]) & (index1[..., 2] == coord[2]))
-        #         indice2 = torch.nonzero((index2[..., 0] == coord[0]) & (index2[..., 1] == coord[1]) & (index2[..., 2] == coord[2]))
+    gt_rad = gt_to_spherical(img_grid, cam_params) # bs, Ncam, WH
+    gt_rad = gt_rad.reshape(bs, Ncam, W, H, -1).flatten(0, 1) # bs*Ncam, W, H
     
-        #         overlap1[i] = feat1[indice1[0][0], indice1[0][1]]
-        #         overlap2[i] = feat2[indice2[0][0], indice2[0][1]]
+    ## mapping value d to k categories: gt_rad = bs*Ncam, W, H -> bs*Ncam, W, H, depth_channels
+    gt_rad = torch.log(gt_rad) - torch.log(torch.tensor(radius_range[0]).float())
+    gt_rad = gt_rad * (radius_channels - 1) / torch.log(torch.tensor(radius_range[1] - 1.).float() / radius_range[0])
+    gt_rad = gt_rad + 1.
 
+    gt_rad = torch.where((gt_rad < radius_channels + 1) & (gt_rad >= 0.0), gt_rad, torch.zeros_like(gt_rad))
+    gt_rad = F.one_hot(gt_rad.long(), num_classes=radius_channels + 1)[..., 1:] # bs*Ncam, W, H, depth_channels
+    ###
+
+    ## mapping corresponding gt values
+    gt_rad_queries = torch.zeros_like(preds, device=preds.device) # bs*Ncam, N_queries, 100
+    pred_pixel_coords = pred_pixel_coords.permute(1, 0, 2) # N_queries, bs*Ncam, 2
+
+    for i in range(gt_rad_queries.shape[0]):
+        gt_rad_queries[i] = gt_rad[i, pred_pixel_coords[..., i, 0], pred_pixel_coords[..., i, 1]]
+    ####
+
+    ### gt_rad_queries, pred: bs*Ncam, N_queries, 100
+    preds = preds.contiguous().view(-1, radius_channels)
+    gt_rad_queries = gt_rad_queries.contiguous().view(-1, radius_channels)
+    
+    fg_mask = torch.max(gt_rad_queries, dim=1).values > 0.0
+    gt_rad_queries = gt_rad_queries[fg_mask]
+    
+    preds = preds[fg_mask]
+    
+    with autocast(enabled=False):
+        depth_loss = F.binary_cross_entropy(
+            preds,
+            gt_rad_queries,
+            reduction='none',
+        ).sum() / max(1.0, fg_mask.sum())
+    print(depth_loss)
+    assert False
+    return depth_loss
+    
+
+def get_downsampled_gt_depth(downsample, gt_depths):
+    """
+    Input:
+        gt_depths: [B, N, H, W]
+    Output:
+        gt_depths: [B*N, h, w, 1]
+    """
+    # if self.downsample == 8 and self.se_depth_map:
+    #    downsample = 16 
+    B, N, H, W = gt_depths.shape
+    gt_depths = gt_depths.view(B * N, H // downsample,
+                                downsample, W // downsample,
+                                downsample, 1)
+    gt_depths = gt_depths.permute(0, 1, 3, 5, 2, 4).contiguous()
+    gt_depths = gt_depths.view(-1, downsample * downsample)
+    gt_depths_tmp = torch.where(gt_depths == 0.0,
+                                1e5 * torch.ones_like(gt_depths),
+                                gt_depths)
+    gt_depths = torch.min(gt_depths_tmp, dim=-1).values
+    gt_depths = gt_depths.view(B * N, H // downsample,
+                                W // downsample)
+    
+    gt_depths = gt_depths.permute(0, 1, 3, 2) # bs, Ncam, W, H
+
+    return gt_depths.float() # bs, Ncam, WH, 1
+
+def gt_to_spherical(img_grid, cam_params, mode=None):
+    """
+    Args:
+        u, v: Pixel coordinates in the image (bs, ncam, H, W)
+        intrinsic: Camera intrinsic matrix (bs, ncam, 3, 3)
+        rotation: Camera rotation matrix (bs, ncam, 3, 3)
+        trans: Camera translation vector (bs, ncam, 3)
+        post_rotation: Post-rotation matrix (bs, ncam, 3, 3)
+        post_trans: Post-translation vector (bs, ncam, 3)
+        bda: BDA rotation matrix (bs, 3, 3)
+
+    Returns:
+        theta: Azimuth angles (bs, ncam, H, W)
+        phi: Elevation angles (bs, ncam, H, W)
+    """
+    rots, trans, intrins, post_rots, post_trans, bda = cam_params
+
+    bs, Ncam, N, _ = img_grid.shape # bs, Ncam, WH, 3
+
+    img_coords -= post_trans.view(bs, Ncam, 1, 3)
+    img_coords = post_rots.inverse().view(bs, Ncam, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
+
+    img_coords = intrins.inverse().view(bs, Ncam, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
+    
+    img_coords = rots.view(bs, Ncam, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
+    img_coords += trans.view(bs, Ncam, 1, 3)
+
+    final_coords = bda.view(bs, 1, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)
+
+    D, W, H = final_coords[..., 0], final_coords[..., 1], final_coords[..., 2]
+
+    rad = torch.sqrt(D**2 + W**2 + H**2) # bs, Ncam, WH
+
+    return rad

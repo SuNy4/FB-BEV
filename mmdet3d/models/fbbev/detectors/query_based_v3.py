@@ -33,7 +33,7 @@ from mmdet3d.datasets.utils import nuscenes_get_rt_matrix
 from mmdet3d.core.bbox import box_np_ops # , corner_to_surfaces_3d, points_in_convex_polygon_3d_jit
 import time
 from sklearn.cluster import KMeans
-
+torch.autograd.set_detect_anomaly(True)
 
 def generate_forward_transformation_matrix(bda, img_meta_dict=None):
     b = bda.size(0)
@@ -166,7 +166,7 @@ class QBON_v3(CenterPoint):
             nn.ReLU(),
             nn.Linear(embed_dim*2, embed_dim),
             nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(embed_dim, N_points),
             # nn.LayerNorm(embed_dim // 4),
             # nn.ReLU(),
             # nn.Linear(embed_dim // 4, N_points),
@@ -180,7 +180,7 @@ class QBON_v3(CenterPoint):
             nn.ReLU(),
             nn.Linear(embed_dim*2, embed_dim),
             nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(embed_dim, N_points),
             # nn.LayerNorm(embed_dim // 4),
             # nn.ReLU(),
             # nn.Linear(embed_dim // 4, N_points),
@@ -194,7 +194,7 @@ class QBON_v3(CenterPoint):
             nn.ReLU(),
             nn.Linear(embed_dim*2, embed_dim),
             nn.ReLU(),
-            nn.Linear(embed_dim, embed_dim),
+            nn.Linear(embed_dim, N_points),
             # nn.LayerNorm(embed_dim // 4),
             # nn.ReLU(),
             # nn.Linear(embed_dim // 4, N_points),
@@ -549,7 +549,7 @@ class QBON_v3(CenterPoint):
 
         if self.with_specific_component('query_img_cross_attn'):
             bs, Ncam, C, W, H = context.shape
-
+            
             context = context.flatten(-2, -1)
             context = context.flatten(0, 1).permute(0, 2, 1) # bsNcam, WH, C
 
@@ -591,6 +591,10 @@ class QBON_v3(CenterPoint):
             inst_queries = context.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, context.size(-1))) # bsNcam, N_queries, C
             inst_queries_img_sph = img_glob_sph.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, img_glob_sph.size(-1))) # bsNcam, N_queries, 2
             inst_queries_img_ref = img_grid.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, img_grid.size(-1))) # bsNcam, N_queries, 2
+
+            return_map['cam_params'] = cam_params
+            return_map['pred_pixel_coords'] = inst_queries_img_ref
+
             ############################################################
             # general_queries = self.main_queries.weight
             # N, _ = general_queries.shape
@@ -646,9 +650,9 @@ class QBON_v3(CenterPoint):
             # query_local_self_attn_mask = local_mask.unsqueeze(1).expand(-1, N, -1)
             # query_global_self_attn_mask = global_mask.unsqueeze(1).expand(-1, N*Ncam, -1)
 
-            return_map['global_queries']=inst_queries
-            #return_map['attn_mask']=valid_query
-            return_map['feature_map']=context
+            # return_map['global_queries']=inst_queries
+            # #return_map['attn_mask']=valid_query
+            # return_map['feature_map']=context
 
 
             ##### Deformable Cross Attention
@@ -709,7 +713,7 @@ class QBON_v3(CenterPoint):
                     query = geo_inst_queries,
                     # attn_mask = query_local_self_attn_mask
                 ) # bsNcam, N_queries, C
-            
+
             phi = inst_queries_img_sph[..., 1]
             sin_phi = torch.sin(phi).unsqueeze(-1) # bs*Ncam, N_queries, 1 
 
@@ -718,21 +722,29 @@ class QBON_v3(CenterPoint):
             r_max_per_query = h_max / (sin_phi + 1e-8) # bs*Ncam, N_queries, 1
             
             radius = self.radius_layer(geo_inst_queries) # bs*Ncam, Nqueries, 100: layer output
-            
-            radius_range = self.radius_range.view(1, 1, -1).expand(bs*Ncam, num_queries, -1) # bs*Ncam, Nqueries, 100: radius range 0~40
+            radius_range = self.radius_range.view(1, 1, -1).expand(bs*Ncam, num_queries, -1) # bs*Ncam, Nqueries, 100: radius range 0~45
 
             mask = radius_range <= r_max_per_query
             radius = torch.where(mask, radius, torch.tensor(float('-inf')).to(radius.device))
+            # radius = radius.sigmoid()
+            # radius[radius < 0.5] = 0 # bs*Ncam, Nqueries, 100
             radius = radius.softmax(dim=-1)
-            
-            _, radius = torch.max(radius, dim=-1) # bs*Ncam, Nqueries
-            radius = radius.unsqueeze(-1) * 0.4
 
-            coords = torch.cat([radius, inst_queries_img_sph], dim=-1).reshape(bs, Ncam, -1, 3).flatten(1, 2) # bs, Ncam*Nqueries, 3
+            return_map['pred_radius'] = radius
+            return_map['gt_depth'] = kwargs['gt_depth']
 
-            d = coords[..., 0] * torch.cos(coords[..., 2]) * torch.cos(coords[..., 1]) # bs, Ncam*Nqueries
-            w = coords[..., 0] * torch.cos(coords[..., 2]) * torch.sin(coords[..., 1]) 
-            h = coords[..., 0] * torch.sin(coords[..., 2])
+            radius = torch.matmul(radius, self.radius_range.unsqueeze(-1)) # bs*Ncam, N_queries, 1
+
+            # indices = torch.sum(radius * radius_values, dim=-1).unsqueeze(-1)
+
+            # _, indices = torch.max(radius, dim=-1) # bs*Ncam, Nqueries
+            # indices = indices.unsqueeze(-1) * 0.4
+
+            sph_coord = torch.cat([radius, inst_queries_img_sph], dim=-1).reshape(bs, Ncam, -1, 3).flatten(1, 2) # bs, Ncam*Nqueries, 3
+
+            d = sph_coord[..., 0] * torch.cos(sph_coord[..., 2]) * torch.cos(sph_coord[..., 1]) # bs, Ncam*Nqueries
+            w = sph_coord[..., 0] * torch.cos(sph_coord[..., 2]) * torch.sin(sph_coord[..., 1]) 
+            h = sph_coord[..., 0] * torch.sin(sph_coord[..., 2])
 
             d = d.unsqueeze(-1) # bs, Ncam*Nqueries, 1
             w = w.unsqueeze(-1)
@@ -789,14 +801,21 @@ class QBON_v3(CenterPoint):
             sem_inst_queries = self.semantic_layer(sem_inst_queries) # bs, Ncam*N_queries, C
             ################# Mapping ##################
             # TODO: d w h extend (d w h)
-            d_shape = self.d_layer(sem_inst_queries).unsqueeze(-1) # bs, Ncam*N_queries, N_points, 1
-            w_shape = self.w_layer(sem_inst_queries).unsqueeze(-1) # bs, Ncam*N_queries, N_points, 1
-            h_shape = self.h_layer(sem_inst_queries).unsqueeze(-1) # bs, Ncam*N_queries, N_points, 1
+            d_shape = self.d_layer(sem_inst_queries) # bs, Ncam*N_queries, N_points
+            w_shape = self.w_layer(sem_inst_queries) # bs, Ncam*N_queries, N_points
+            h_shape = self.h_layer(sem_inst_queries) # bs, Ncam*N_queries, N_points
             # num_offset = d_shape.shape[2]
             ############################################
-            d = d.unsqueeze(-1).repeat(1, 1, d_shape.shape[2], 1) + d_shape # bs, Ncam*Nqueries, N_points, 1
-            w = w.unsqueeze(-1).repeat(1, 1, w_shape.shape[2], 1) + w_shape # bs, Ncam*Nqueries, N_points, 1
-            h = h.unsqueeze(-1).repeat(1, 1, h_shape.shape[2], 1) + h_shape # bs, Ncam*Nqueries, N_points, 1
+            d = d.clone().expand(-1, -1, d_shape.shape[2])
+            d = d + d_shape # bs, Ncam*Nqueries, N_points
+            w = w.clone().expand(-1, -1, w_shape.shape[2])
+            w = w + w_shape # bs, Ncam*Nqueries, N_points
+            h = h.clone().expand(-1, -1, h_shape.shape[2])
+            h = h + h_shape # bs, Ncam*Nqueries, N_points
+
+            d = d.unsqueeze(-1)
+            w = w.unsqueeze(-1)
+            h = h.unsqueeze(-1)
 
             # d = d.unsqueeze(3).unsqueeze(3).repeat(1, 1, 1, num_offset, num_offset, 1)
             # w = w.unsqueeze(2).unsqueeze(4).repeat(1, 1, num_offset, 1, num_offset, 1)
@@ -809,12 +828,14 @@ class QBON_v3(CenterPoint):
             coords[..., 0] = coords[..., 0] - self.grid_config['x'][0]
             coords[..., 1] = coords[..., 1] - self.grid_config['y'][0]
             coords[..., 2] = coords[..., 2] - self.grid_config['z'][0]
-            coords = (coords / 0.4).long() # bs, Ncam*Nqueries, N_points, 3
 
-            coords[..., 0] = coords[..., 0].clamp(0, 199)
-            coords[..., 1] = coords[..., 1].clamp(0, 199)
-            coords[..., 2] = coords[..., 2].clamp(0, 15)
-
+            coords = coords // 0.4 # bs, Ncam*Nqueries, N_points, 3
+            
+            coords_clamped = coords.clone()
+            coords_clamped[..., 0] = coords[..., 0].clamp(0, 199)
+            coords_clamped[..., 1] = coords[..., 1].clamp(0, 199)
+            coords_clamped[..., 2] = coords[..., 2].clamp(0, 15)
+            
             return_map['geometry'] = coords.flatten(1, 2) # bs, N, 3
 
             # global_pos = global_pos.reshape(bs, Ncam, -1, C).flatten(1, 2) # bs, Ncam*N_queries, C
@@ -1066,7 +1087,7 @@ class QBON_v3(CenterPoint):
             # # occ_feat[mask] = 0
             # occ_feat = occ_feat.reshape(bs, D, W, H, -1) # bs, D, W, H, 50
             return_map['sparse_feat'] = inst_queries.reshape(bs, Ncam, -1, C).flatten(1, 2)
-            return_map['sparse_idx'] = coords
+            return_map['sparse_idx'] = coords_clamped.detach().long()
             ##################################################################################
 
             # occ_index = [] # [bs][N][3] occupied voxel indexes

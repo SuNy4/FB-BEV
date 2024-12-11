@@ -15,7 +15,7 @@ from mmcv.cnn import build_conv_layer, build_norm_layer, build_upsample_layer
 from mmdet3d.models.fbbev.modules.occ_loss_utils import lovasz_softmax, CustomFocalLoss
 from mmdet3d.models.fbbev.modules.occ_loss_utils import nusc_class_frequencies, nusc_class_names
 from mmdet3d.models.fbbev.modules.occ_loss_utils import geo_scal_loss, sem_scal_loss, CE_ssc_loss, BCE_ssc_loss, cos_sim_loss,\
-                                                        hard_feature_query_alignment_loss, feature_query_reconstruction_loss, query_diversity_loss, chamfer_distance_loss
+                                                        hard_feature_query_alignment_loss, feature_query_reconstruction_loss, query_diversity_loss, chamfer_distance_loss, radius_loss
 from torch.utils.checkpoint import checkpoint as cp
 from mmcv.runner import BaseModule, force_fp32
 from torch.cuda.amp import autocast
@@ -45,7 +45,7 @@ class OccHead(BaseModule):
         use_deblock=True,
     ):
         super(OccHead, self).__init__()
-
+        torch.autograd.set_detect_anomaly(True)
         self.fp16_enabled=False
 
         self.mlphead = nn.Sequential(
@@ -230,19 +230,22 @@ class OccHead(BaseModule):
 
     @force_fp32()
     def forward_sparse(self, feats=None, sparse_idx=None, **kwargs):
+        
         # sparse feats: bs, Ncam*Nqueries, C
         # sparse idx: bs, Ncam*Nqueries, N_pts, 3
         bs, _, N_pts, _ = sparse_idx.shape
         sparse_idx = sparse_idx.permute(1, 0, 2, 3) # sparse idx: Ncam*Nqueries, bs, N_pts, 3
-        
+
+
         feats = feats.permute(0, 2, 1) # bs, C, N
-        feats = self.mlphead(feats).permute(0, 2, 1) # bs, Ncam*N_queries, N_Classes
-        feats = feats.unsqueeze(2).repeat(1, 1, N_pts, 1)
+        feats = self.mlphead(feats)
+        feats = feats.permute(0, 2, 1) # bs, Ncam*N_queries, N_Classes
+        feats = feats.unsqueeze(2).expand(-1, -1, N_pts, -1)
 
         map = torch.zeros(bs, 200, 200, 16, 17).to(feats.device)
         empty = torch.zeros(bs, 200, 200, 16, 1).to(feats.device)
 
-        batch_indices = torch.arange(bs, device=feats.device).view(-1, 1)
+        batch_indices = torch.arange(bs, device=feats.device).unsqueeze(-1)
 
         for j, idx in enumerate(sparse_idx):
             # map.scatter_add_(0, torch.stack((batch_indices, idx[..., 0], idx[..., 1], idx[..., 2]), dim=0), feats[:, j])
@@ -251,7 +254,6 @@ class OccHead(BaseModule):
         empty[(map == 0).all(dim=-1)] = 1
 
         map = torch.cat([empty, map], dim=-1).permute(0, 4, 1, 2, 3) # bs, C, D, W, H
-
         # feats = torch.softmax(feats, dim=1)
         ########################################################
         # sparse_feats = [feats[i, sparse_idx[i]] for i in range(bs)]
@@ -373,7 +375,8 @@ class OccHead(BaseModule):
         # loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['geom'], target_voxels, ignore_index=255, non_empty_idx=0, binary=True)
         # loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=0)
                                                         #+ 0.1* self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['geom'], target_voxels, ignore_index=255, non_empty_idx=0, binary=True))/2
-        loss_dict['chamfer_dist_loss_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * chamfer_distance_loss(kwargs['results']['geometry'], target_voxels)
+        # loss_dict['chamfer_dist_loss_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * chamfer_distance_loss(kwargs['results']['geometry'], target_voxels)
+        loss_dict['radius_loss_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * radius_loss(kwargs['gt_depth'], kwargs['results']['pred_radius'], kwargs['results']['pred_pixel_coords'], kwargs['results']['cam_params'])
         loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = self.loss_voxel_sem_scal_weight * sem_scal_loss(output_voxels, target_voxels, ignore_index=0) # Check only 1~17 classes
 
         # loss_dict['query_loss_{}'.format(tag)] = self.loss_feature_alignment_loss * hard_feature_query_alignment_loss(kwargs['results']['feature_map'], kwargs['results']['global_queries'])
