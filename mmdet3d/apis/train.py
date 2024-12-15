@@ -324,11 +324,11 @@ def train_detector(model,
         runner.resume(cfg.resume_from)
     elif cfg.load_from:
         runner.load_checkpoint(cfg.load_from)
-    for name, param in model.named_parameters():
-        print(f"Parameter Name: {name}")
-        print(f"Shape: {param.shape}")
-        print(f"Requires Grad: {param.requires_grad}")
-        print()
+    # for name, param in model.named_parameters():
+    #     print(f"Parameter Name: {name}")
+    #     print(f"Shape: {param.shape}")
+    #     print(f"Requires Grad: {param.requires_grad}")
+    #     print()
     runner.run(data_loaders, cfg.workflow)
 
 

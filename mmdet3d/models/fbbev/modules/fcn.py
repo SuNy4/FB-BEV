@@ -42,63 +42,142 @@ class UpsampleLayer(nn.Module):
 
 @NECKS.register_module()
 class BEV2DFCN(nn.Module):
-    def __init__(self, flatten_height, height, in_channels, mid_channels, h_level, out_channels=None):
+    def __init__(self, in_channels, dw_kernel_size=list, dw_stride=list, dw_pad=list, 
+                 uw_kernel_size=list, uw_stride=list, uw_pad=list,):
         super(BEV2DFCN, self).__init__()
-        self.h_level = h_level
-        self.flatten_height = flatten_height
-        self.conv0 = nn.Conv2d(in_channels*height, mid_channels, kernel_size=3, stride=1, padding=1) if self.flatten_height else None
-        self.conv_1 = nn.Conv1d(mid_channels, mid_channels*h_level[0], kernel_size=1)
-        self.conv_2 = nn.Conv1d(mid_channels*h_level[0], mid_channels*h_level[1], kernel_size=1)
-        self.conv_3 = nn.Conv1d(mid_channels*h_level[1], mid_channels*h_level[2], kernel_size=1)
-        self.conv2 = nn.Conv1d(mid_channels, height, kernel_size=1) if self.flatten_height else None
-        self.bn_flat0 = nn.BatchNorm2d(mid_channels) if self.flatten_height else None
-        self.bn_flat_1 = nn.BatchNorm1d(mid_channels*h_level[0])
-        self.bn_flat_2 = nn.BatchNorm1d(mid_channels*h_level[1])
-        self.bn_flat2 = nn.BatchNorm2d(height) if self.flatten_height else None
-        self.gelu = nn.GELU()
-        self.encoder1 = nn.Conv2d(mid_channels, mid_channels*2, kernel_size=4, stride=2, padding=1)
-        self.encoder2 = nn.Conv2d(mid_channels*2, mid_channels*4, kernel_size=4, stride=2, padding=1)
-        self.decoder1 = nn.ConvTranspose2d(mid_channels*4, mid_channels*2, kernel_size=4, stride=2, padding=1)
-        self.decoder2 = nn.ConvTranspose2d(mid_channels*2, mid_channels, kernel_size=4, stride=2, padding=1)
-        # self.decoder1 = UpsampleLayer(2, 'bilinear', in_channels=mid_channels*4, out_channels=mid_channels*2, convtype='2d')
-        # self.decoder2 = UpsampleLayer(2, 'bilinear', in_channels=mid_channels*2, out_channels=mid_channels, convtype='2d')
+        self.downsample_1 = nn.Sequential(
+            # nn.Conv2d(in_channels, in_channels*2, kernel_size=3, stride=1, padding=1), # W, H -> W, H
+            # nn.ReLU(),
+            nn.Conv2d(in_channels, in_channels*2, kernel_size=dw_kernel_size, stride=dw_stride, padding=dw_pad), # W, H -> W/2, H/2
+            nn.BatchNorm2d(in_channels*2),
+            nn.ReLU(),
+            nn.Conv2d(in_channels*2, in_channels*2, kernel_size=1, stride=1, padding=0)
+        )
 
-        # self.encoder1 = AggregationBlock(out_channels, out_channels*2)
-        # self.encoder2 = AggregationBlock(out_channels*2, out_channels*4)
-        
-        # Batch Normalization
-        self.bn1 = nn.BatchNorm2d(mid_channels*2)
-        self.bn2 = nn.BatchNorm2d(mid_channels*4)
-        self.bn3 = nn.BatchNorm2d(mid_channels*2)
-        self.bn4 = nn.BatchNorm2d(mid_channels)
+        self.downsample_2 = nn.Sequential(
+            # nn.Conv2d(in_channels*2, in_channels*4, kernel_size=3, stride=1, padding=1),
+            # nn.ReLU(),
+            nn.Conv2d(in_channels*2, in_channels*4, kernel_size=dw_kernel_size, stride=dw_stride, padding=dw_pad),
+            nn.BatchNorm2d(in_channels*4),
+            nn.ReLU(),
+            nn.Conv2d(in_channels*4, in_channels*4, kernel_size=1, stride=1, padding=0)
+        )
+
+        self.upsample_1 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(in_channels*4, in_channels*2, kernel_size=uw_kernel_size, stride=uw_stride, padding=uw_pad),  # W, H -> W, H
+            nn.BatchNorm2d(in_channels*2),
+            nn.ReLU(),
+            nn.Conv2d(in_channels*2, in_channels*2, kernel_size=1, stride=1, padding=0)
+        )
+
+        self.upsample_2 = nn.Sequential(
+            nn.Upsample(scale_factor=2, mode='bilinear', align_corners=True),
+            nn.Conv2d(in_channels*2, in_channels, kernel_size=uw_kernel_size, stride=uw_stride, padding=uw_pad),  # W, H -> W, H
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(),
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        )
+
+        self.merge_1 = nn.Sequential(
+            nn.Conv2d(in_channels*4, in_channels*4, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_channels*4),
+            nn.ReLU(),
+            nn.Conv2d(in_channels*4, in_channels*4, kernel_size=1, stride=1, padding=0)
+        )
+
+        self.merge_2 = nn.Sequential(
+            nn.Conv2d(in_channels*2, in_channels*2, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_channels*2),
+            nn.ReLU(),
+            nn.Conv2d(in_channels*2, in_channels*2, kernel_size=1, stride=1, padding=0)
+        )
+
+        self.merge_3 = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_channels),
+            nn.ReLU(),
+            nn.Conv2d(in_channels, in_channels, kernel_size=1, stride=1, padding=0)
+        )
 
     def forward(self, x):
-        if self.flatten_height:
-            x = self.gelu(self.bn_flat0(self.conv0(x)))
+
+        # Downwards
+        d1 = self.downsample_1(x) # bs, W/2, H/2, C*2
+        d2 = self.downsample_2(d1) # bs, W/4, H/4, C*4
+
+        # Merge Path
+        d2 = self.merge_1(d2) # bs, W/4, H/4, C*4
+        d1 = self.merge_2(d1) # bs, W/2, H/2, C*2
+        x_merge = self.merge_3(x) # bs, W, H, C
+
+        # Upwards
+        u1 = self.upsample_1(d2) # bs, W/2, H/2, C*2
+        u1 = u1 + d1
+        u2 = self.upsample_2(u1) # bs, W, H, C
+        out = u2 + x_merge
+
+        return out
+
+######## restore H method ###############
+# class BEV2DFCN(nn.Module):
+#     def __init__(self, flatten_height, height, in_channels, mid_channels, h_level, out_channels=None):
+#         super(BEV2DFCN, self).__init__()
+#         self.h_level = h_level
+#         self.flatten_height = flatten_height
+#         self.conv0 = nn.Conv2d(in_channels*height, mid_channels, kernel_size=3, stride=1, padding=1) if self.flatten_height else None
+#         self.conv_1 = nn.Conv1d(mid_channels, mid_channels*h_level[0], kernel_size=1)
+#         self.conv_2 = nn.Conv1d(mid_channels*h_level[0], mid_channels*h_level[1], kernel_size=1)
+#         self.conv_3 = nn.Conv1d(mid_channels*h_level[1], mid_channels*h_level[2], kernel_size=1)
+#         self.conv2 = nn.Conv1d(mid_channels, height, kernel_size=1) if self.flatten_height else None
+#         self.bn_flat0 = nn.BatchNorm2d(mid_channels) if self.flatten_height else None
+#         self.bn_flat_1 = nn.BatchNorm1d(mid_channels*h_level[0])
+#         self.bn_flat_2 = nn.BatchNorm1d(mid_channels*h_level[1])
+#         self.bn_flat2 = nn.BatchNorm2d(height) if self.flatten_height else None
+#         self.gelu = nn.GELU()
+#         self.encoder1 = nn.Conv2d(mid_channels, mid_channels*2, kernel_size=4, stride=2, padding=1)
+#         self.encoder2 = nn.Conv2d(mid_channels*2, mid_channels*4, kernel_size=4, stride=2, padding=1)
+#         self.decoder1 = nn.ConvTranspose2d(mid_channels*4, mid_channels*2, kernel_size=4, stride=2, padding=1)
+#         self.decoder2 = nn.ConvTranspose2d(mid_channels*2, mid_channels, kernel_size=4, stride=2, padding=1)
+#         # self.decoder1 = UpsampleLayer(2, 'bilinear', in_channels=mid_channels*4, out_channels=mid_channels*2, convtype='2d')
+#         # self.decoder2 = UpsampleLayer(2, 'bilinear', in_channels=mid_channels*2, out_channels=mid_channels, convtype='2d')
+
+#         # self.encoder1 = AggregationBlock(out_channels, out_channels*2)
+#         # self.encoder2 = AggregationBlock(out_channels*2, out_channels*4)
         
-        # Downsample
-        # e1 = self.encoder1(x)
-        # e2 = self.encoder2(e1)
-        e1 = self.gelu(self.bn1(self.encoder1(x))) #50
-        e2 = self.gelu(self.bn2(self.encoder2(e1))) #25
+#         # Batch Normalization
+#         self.bn1 = nn.BatchNorm2d(mid_channels*2)
+#         self.bn2 = nn.BatchNorm2d(mid_channels*4)
+#         self.bn3 = nn.BatchNorm2d(mid_channels*2)
+#         self.bn4 = nn.BatchNorm2d(mid_channels)
 
-        # Upsample
-        d1 = self.gelu(self.bn3(self.decoder1(e2))) #50
-        d1 = d1 + e1
-        d2 = self.gelu(self.bn4(self.decoder2(d1)))
-        out = d2 + x
-        bs, _, D, W = out.shape
+#     def forward(self, x):
+#         if self.flatten_height:
+#             x = self.gelu(self.bn_flat0(self.conv0(x)))
+        
+#         # Downsample
+#         # e1 = self.encoder1(x)
+#         # e2 = self.encoder2(e1)
+#         e1 = self.gelu(self.bn1(self.encoder1(x))) #50
+#         e2 = self.gelu(self.bn2(self.encoder2(e1))) #25
 
-        out = self.gelu(self.bn_flat_1(self.conv_1(out.flatten(2, 3)))) # bs, C, DW
-        out = self.gelu(self.bn_flat_2(self.conv_2(out)))
-        out = self.conv_3(out).reshape(bs, -1, D, W, self.h_level[2])
-        if self.flatten_height:
-            bev_h = self.gelu(self.bn_flat2(self.conv2(out.flatten(2, 3)))).reshape(bs, -1, D, W).permute(0, 2, 3, 1) # bs, H, D, W => bs, D, W, H
-            bev_h = bev_h.sigmoid()
+#         # Upsample
+#         d1 = self.gelu(self.bn3(self.decoder1(e2))) #50
+#         d1 = d1 + e1
+#         d2 = self.gelu(self.bn4(self.decoder2(d1)))
+#         out = d2 + x
+#         bs, _, D, W = out.shape
 
-            return out, bev_h
-        else:
-            return out
+#         out = self.gelu(self.bn_flat_1(self.conv_1(out.flatten(2, 3)))) # bs, C, DW
+#         out = self.gelu(self.bn_flat_2(self.conv_2(out)))
+#         out = self.conv_3(out).reshape(bs, -1, D, W, self.h_level[2])
+#         if self.flatten_height:
+#             bev_h = self.gelu(self.bn_flat2(self.conv2(out.flatten(2, 3)))).reshape(bs, -1, D, W).permute(0, 2, 3, 1) # bs, H, D, W => bs, D, W, H
+#             bev_h = bev_h.sigmoid()
+
+#             return out, bev_h
+#         else:
+#             return out
 
 ######## Original FCN2D ################
 # @NECKS.register_module()

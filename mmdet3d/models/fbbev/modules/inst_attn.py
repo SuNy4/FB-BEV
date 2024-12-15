@@ -55,13 +55,12 @@ class TransformerLayer(nn.Module):
         else:
             attn_results, weights = self.attn(query, key, value, need_weights=True, attn_mask=attn_mask)
             query = self.norm1(query + attn_results)
-            nan_mask = torch.isnan(query)
-            query[nan_mask] = 0
+            # nan_mask = torch.isnan(query)
+            # query[nan_mask] = 0
         if not hasattr(self, 'ffn'):
             return query
         query = self.norm2(query + self.ffn(query))
-        nan_mask = torch.isnan(query)
-        query[nan_mask] = 0
+
         return query, weights
 
 

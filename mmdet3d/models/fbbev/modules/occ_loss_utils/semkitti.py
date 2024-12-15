@@ -323,7 +323,7 @@ def cos_sim_loss(pred):
     return total_loss
 
 
-def radius_loss(gt, preds, pred_pixel_coords, cam_params):
+def radius_ce_loss(gt, preds, pred_pixel_coords, cam_params):
     # gt: bs, Ncam, ori_H, ori_W (gt depth for image)
     # pred: bs*Ncam, N_queries, 100
     # pred_pixel_coords: bs*Ncam, N_queries, 2
@@ -332,8 +332,9 @@ def radius_loss(gt, preds, pred_pixel_coords, cam_params):
     radius_channels = preds.shape[-1]
 
     bs, Ncam, orig_H, orig_W = gt.shape
-    gt_downsample = get_downsampled_gt_depth(16, gt) #  bs, Ncam, W, H
-    _, _, W, H = gt_downsample.shape
+    gt_downsample = get_downsampled_gt_depth(16, gt) #  bs*Ncam, W, H
+    _, W, H = gt_downsample.shape
+    gt_downsample = gt_downsample.contiguous().view(bs, Ncam, W, H)
 
     assert (orig_W // W) == (orig_H // H)
 
@@ -352,8 +353,9 @@ def radius_loss(gt, preds, pred_pixel_coords, cam_params):
     img_grid = torch.cat([img_grid, gt_downsample], dim=-1) # bs, Ncam, WH, 3
 
     gt_rad = gt_to_spherical(img_grid, cam_params) # bs, Ncam, WH
-    gt_rad = gt_rad.reshape(bs, Ncam, W, H, -1).flatten(0, 1) # bs*Ncam, W, H
-    
+    gt_rad = gt_rad.reshape(bs, Ncam, W, H).flatten(0, 1) # bs*Ncam, W, H
+    gt_rad[gt_rad > 45] = 45
+
     ## mapping value d to k categories: gt_rad = bs*Ncam, W, H -> bs*Ncam, W, H, depth_channels
     gt_rad = torch.log(gt_rad) - torch.log(torch.tensor(radius_range[0]).float())
     gt_rad = gt_rad * (radius_channels - 1) / torch.log(torch.tensor(radius_range[1] - 1.).float() / radius_range[0])
@@ -362,33 +364,32 @@ def radius_loss(gt, preds, pred_pixel_coords, cam_params):
     gt_rad = torch.where((gt_rad < radius_channels + 1) & (gt_rad >= 0.0), gt_rad, torch.zeros_like(gt_rad))
     gt_rad = F.one_hot(gt_rad.long(), num_classes=radius_channels + 1)[..., 1:] # bs*Ncam, W, H, depth_channels
     ###
-
+    
     ## mapping corresponding gt values
     gt_rad_queries = torch.zeros_like(preds, device=preds.device) # bs*Ncam, N_queries, 100
-    pred_pixel_coords = pred_pixel_coords.permute(1, 0, 2) # N_queries, bs*Ncam, 2
+    pred_pixel_coords = pred_pixel_coords.permute(1, 0, 2).long() # N_queries, bs*Ncam, 2
 
     for i in range(gt_rad_queries.shape[0]):
         gt_rad_queries[i] = gt_rad[i, pred_pixel_coords[..., i, 0], pred_pixel_coords[..., i, 1]]
     ####
 
     ### gt_rad_queries, pred: bs*Ncam, N_queries, 100
-    preds = preds.contiguous().view(-1, radius_channels)
+    pred_rad = preds
+    pred_rad = pred_rad.contiguous().view(-1, radius_channels)
     gt_rad_queries = gt_rad_queries.contiguous().view(-1, radius_channels)
     
     fg_mask = torch.max(gt_rad_queries, dim=1).values > 0.0
     gt_rad_queries = gt_rad_queries[fg_mask]
     
-    preds = preds[fg_mask]
-    
+    pred_rad = pred_rad[fg_mask]
     with autocast(enabled=False):
-        depth_loss = F.binary_cross_entropy(
-            preds,
+        radius_loss = F.binary_cross_entropy(
+            pred_rad,
             gt_rad_queries,
             reduction='none',
         ).sum() / max(1.0, fg_mask.sum())
-    print(depth_loss)
-    assert False
-    return depth_loss
+
+    return radius_loss
     
 
 def get_downsampled_gt_depth(downsample, gt_depths):
@@ -413,11 +414,11 @@ def get_downsampled_gt_depth(downsample, gt_depths):
     gt_depths = gt_depths.view(B * N, H // downsample,
                                 W // downsample)
     
-    gt_depths = gt_depths.permute(0, 1, 3, 2) # bs, Ncam, W, H
+    gt_depths = gt_depths.permute(0, 2, 1) # bs*Ncam, W, H
 
-    return gt_depths.float() # bs, Ncam, WH, 1
+    return gt_depths.float() # bs*Ncam, WH, 1
 
-def gt_to_spherical(img_grid, cam_params, mode=None):
+def gt_to_spherical(img_coords, cam_params, mode=None):
     """
     Args:
         u, v: Pixel coordinates in the image (bs, ncam, H, W)
@@ -434,7 +435,7 @@ def gt_to_spherical(img_grid, cam_params, mode=None):
     """
     rots, trans, intrins, post_rots, post_trans, bda = cam_params
 
-    bs, Ncam, N, _ = img_grid.shape # bs, Ncam, WH, 3
+    bs, Ncam, N, _ = img_coords.shape # bs, Ncam, WH, 3
 
     img_coords -= post_trans.view(bs, Ncam, 1, 3)
     img_coords = post_rots.inverse().view(bs, Ncam, 1, 3, 3).matmul(img_coords.unsqueeze(-1)).squeeze(-1)

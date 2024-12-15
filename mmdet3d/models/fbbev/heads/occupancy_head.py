@@ -15,7 +15,7 @@ from mmcv.cnn import build_conv_layer, build_norm_layer, build_upsample_layer
 from mmdet3d.models.fbbev.modules.occ_loss_utils import lovasz_softmax, CustomFocalLoss
 from mmdet3d.models.fbbev.modules.occ_loss_utils import nusc_class_frequencies, nusc_class_names
 from mmdet3d.models.fbbev.modules.occ_loss_utils import geo_scal_loss, sem_scal_loss, CE_ssc_loss, BCE_ssc_loss, cos_sim_loss,\
-                                                        hard_feature_query_alignment_loss, feature_query_reconstruction_loss, query_diversity_loss, chamfer_distance_loss, radius_loss
+                                                        hard_feature_query_alignment_loss, feature_query_reconstruction_loss, query_diversity_loss, chamfer_distance_loss, radius_ce_loss
 from torch.utils.checkpoint import checkpoint as cp
 from mmcv.runner import BaseModule, force_fp32
 from torch.cuda.amp import autocast
@@ -48,26 +48,26 @@ class OccHead(BaseModule):
         torch.autograd.set_detect_anomaly(True)
         self.fp16_enabled=False
 
-        self.mlphead = nn.Sequential(
-            nn.Conv1d(in_channels, 128, kernel_size=1),
-            nn.BatchNorm1d(128),
-            nn.ReLU(),
-            nn.Conv1d(128, 64, kernel_size=1),
-            nn.BatchNorm1d(64),
-            nn.ReLU(),
-            nn.Conv1d(64, out_channel, kernel_size=1),
-            nn.BatchNorm1d(out_channel)
-        )        
-        
         # self.mlphead = nn.Sequential(
         #     nn.Conv1d(in_channels, 128, kernel_size=1),
         #     nn.BatchNorm1d(128),
-        #     nn.GELU(),
+        #     nn.ReLU(),
         #     nn.Conv1d(128, 64, kernel_size=1),
         #     nn.BatchNorm1d(64),
-        #     nn.GELU(),
+        #     nn.ReLU(),
         #     nn.Conv1d(64, out_channel, kernel_size=1),
-        # )
+        #     nn.BatchNorm1d(out_channel)
+        # )        
+        
+        self.mlphead = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // 2, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_channels // 2),
+            nn.ReLU(),
+            nn.Conv2d(in_channels // 2, in_channels // 4, kernel_size=1, stride=1, padding=0),
+            nn.BatchNorm2d(in_channels // 4),
+            nn.ReLU(),
+            nn.Conv2d(in_channels // 4, out_channel, kernel_size=1, stride=1, padding=0),
+        )
       
         if type(in_channels) is not list:
             in_channels = [in_channels]
@@ -231,60 +231,21 @@ class OccHead(BaseModule):
     @force_fp32()
     def forward_sparse(self, feats=None, sparse_idx=None, **kwargs):
         
-        # sparse feats: bs, Ncam*Nqueries, C
-        # sparse idx: bs, Ncam*Nqueries, N_pts, 3
-        bs, _, N_pts, _ = sparse_idx.shape
-        sparse_idx = sparse_idx.permute(1, 0, 2, 3) # sparse idx: Ncam*Nqueries, bs, N_pts, 3
+        # bs, C, x, y
+        dw = feats[0]
+        dh = feats[1]
+        wh = feats[2]
 
+        dw = self.mlphead(dw)
+        dh = self.mlphead(dh)
+        wh = self.mlphead(wh)
 
-        feats = feats.permute(0, 2, 1) # bs, C, N
-        feats = self.mlphead(feats)
-        feats = feats.permute(0, 2, 1) # bs, Ncam*N_queries, N_Classes
-        feats = feats.unsqueeze(2).expand(-1, -1, N_pts, -1)
-
-        map = torch.zeros(bs, 200, 200, 16, 17).to(feats.device)
-        empty = torch.zeros(bs, 200, 200, 16, 1).to(feats.device)
-
-        batch_indices = torch.arange(bs, device=feats.device).unsqueeze(-1)
-
-        for j, idx in enumerate(sparse_idx):
-            # map.scatter_add_(0, torch.stack((batch_indices, idx[..., 0], idx[..., 1], idx[..., 2]), dim=0), feats[:, j])
-            map[batch_indices, idx[..., 0], idx[..., 1], idx[..., 2]] = feats[:, j]
-
-        empty[(map == 0).all(dim=-1)] = 1
-
-        map = torch.cat([empty, map], dim=-1).permute(0, 4, 1, 2, 3) # bs, C, D, W, H
-        # feats = torch.softmax(feats, dim=1)
-        ########################################################
-        # sparse_feats = [feats[i, sparse_idx[i]] for i in range(bs)]
-        # feats = torch.zeros(bs, D*W*H, self.out_channel, device=feats.device) #bs, DWH, 17 no free cls
+        dw = dw.unsqueeze(-1)
+        dh = dh.unsqueeze(-2)
+        wh = wh.unsqueeze(-3)
         
-        # for i in range(bs):
-        #     sparse_feats[i] = self.mlphead(sparse_feats[i].unsqueeze(0)).squeeze(0)
-        #     feats[i, sparse_idx[i]] = sparse_feats[i]
-        
-        # feats = F.softmax(feats, dim=-1) # bs, DWH, 17
-        # feats = torch.cat([(~sparse_idx).unsqueeze(-1).float(), feats], dim=-1).permute(0, 2, 1) # bs, 18, DWH
-        # feats = feats.reshape(bs, -1, D, W, H) # bs, 18, D, W, H
-        ########################################################
-
-        ## voxel feats: bs, N, C
-        #
-        # bs, N, C = sparse_feats.shape
-        # sparse_feats = self.mlphead(sparse_feats.permute(0, 2, 1)).permute(0, 2, 1) # bs, N, class
-        # sparse_feats = F.softmax(sparse_feats, dim=-1)
-        # sparse_zeros = torch.zeros(bs, N, 1).cuda()
-        # sparse_feats = torch.cat((sparse_zeros, sparse_feats), dim=2)
-        
-        # voxel_feats = torch.ones(bs, 200, 200, 16, self.out_channel+1).cuda()
-        
-        # for i, index in enumerate(sparse_idx):
-        #     d_indices = index[:, 0]
-        #     w_indices = index[:, 1]
-        #     h_indices = index[:, 2]
-        #     voxel_feats[i, d_indices, w_indices, h_indices] = sparse_feats[i, :len(index)]
-
-        # voxel_feats = voxel_feats.permute(0, 4, 1, 2, 3)
+        # eps = 1e-8
+        map = dw * dh * wh
         
 
         res = {
@@ -336,7 +297,8 @@ class OccHead(BaseModule):
         # kwargs['results']['pred_cam_mask'] = F.interpolate(kwargs['results']['pred_cam_mask'].unsqueeze(1), scale_factor=2, mode='trilinear', align_corners=False).squeeze(1)
         # resize gt                       
         B, C, H, W, D = output_voxels.shape
-        ratio = target_voxels.shape[2] // H
+
+        ratio = target_voxels.shape[1] // H
 
         if ratio != 1:
             target_voxels = target_voxels.reshape(B, H, ratio, W, ratio, D, ratio).permute(0,1,3,5,2,4,6).reshape(B, H, W, D, ratio**3)
@@ -360,9 +322,9 @@ class OccHead(BaseModule):
 
         # igore 255 = ignore noise. we keep the loss bascward for the label=0 (free voxels)
 
-        if self.use_focal_loss:
+        # if self.use_focal_loss:
         #     # CE loss for whole scene
-             loss_dict['loss_voxel_ce_{}'.format(tag)] = self.loss_voxel_ce_weight * self.focal_loss(output_voxels, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=255, semantic=True)
+             # loss_dict['loss_voxel_ce_{}'.format(tag)] = self.loss_voxel_ce_weight * self.focal_loss(output_voxels, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=255, semantic=True)
             # loss_dict['loss_voxel_geo_ce_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * self.focal_loss(kwargs['results']['geom'], target_voxels, ignore_index=255)
         # else:
         #     loss_dict['loss_voxel_ce_{}'.format(tag)] = self.loss_voxel_ce_weight * CE_ssc_loss(output_voxels, target_voxels, self.class_weights.type_as(output_voxels), ignore_index=255)
@@ -373,10 +335,10 @@ class OccHead(BaseModule):
         # loss_dict['loss_voxel_geo_scal_cam_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['pred_cam_mask'], cam_mask, ignore_index=255, non_empty_idx=0, binary=True) #\
                                                            #+ self.loss_cos_sim_weight * cos_sim_loss(kwargs['results']['overlapped_pair'])
         # loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['geom'], target_voxels, ignore_index=255, non_empty_idx=0, binary=True)
-        # loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=0)
+        loss_dict['loss_voxel_geo_scal_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * geo_scal_loss(output_voxels, target_voxels, ignore_index=255, non_empty_idx=0)
                                                         #+ 0.1* self.loss_voxel_geo_scal_weight * geo_scal_loss(kwargs['results']['geom'], target_voxels, ignore_index=255, non_empty_idx=0, binary=True))/2
         # loss_dict['chamfer_dist_loss_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * chamfer_distance_loss(kwargs['results']['geometry'], target_voxels)
-        loss_dict['radius_loss_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * radius_loss(kwargs['gt_depth'], kwargs['results']['pred_radius'], kwargs['results']['pred_pixel_coords'], kwargs['results']['cam_params'])
+        loss_dict['radius_loss_{}'.format(tag)] = self.loss_voxel_geo_scal_weight * radius_ce_loss(kwargs['results']['gt_depth'], kwargs['results']['pred_radius'], kwargs['results']['pred_pixel_coords'], kwargs['results']['cam_params'])
         loss_dict['loss_voxel_sem_scal_{}'.format(tag)] = self.loss_voxel_sem_scal_weight * sem_scal_loss(output_voxels, target_voxels, ignore_index=0) # Check only 1~17 classes
 
         # loss_dict['query_loss_{}'.format(tag)] = self.loss_feature_alignment_loss * hard_feature_query_alignment_loss(kwargs['results']['feature_map'], kwargs['results']['global_queries'])
