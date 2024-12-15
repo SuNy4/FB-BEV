@@ -7,7 +7,7 @@
 
 # we follow the online training settings  from solofusion
 num_gpus = 3
-samples_per_gpu = 5
+samples_per_gpu = 10
 num_iters_per_epoch = int(28130 // (num_gpus * samples_per_gpu) * 4.554) # single_scene: 120, whole_scene: 28130, half_scene: 13979
 num_epochs = 20
 checkpoint_epoch_interval = 1
@@ -19,7 +19,7 @@ use_custom_eval_hook = True
 # lowering performance. To increase diversity, we split each training sequence
 # in half to ~20 keyframes, and sample these shorter sequences during training.
 # During testing, we do not do this splitting.
-train_sequences_split_num = 4
+train_sequences_split_num = 2
 test_sequences_split_num = 1
 
 # By default, 3D detection datasets randomly choose another sample if there is
@@ -79,7 +79,7 @@ grid_config = {
     'x': [-40, 40, 0.8],
     'y': [-40, 40, 0.8],
     'z': [-1, 5.4, 0.8],
-    'radius':[2.0, 42.0, 100], # radius range: 0~40, how many steps: 100
+    'radius':[1.0, 41.0, 100], # radius range: 0~40, how many steps: 100
     'shape': [200, 200, 16],
     'depth': [2.0, 42.0, 0.5],
     'Cam_Setting': [55, 0, -55, -100, 180, 100] # Front Left ~ Back Left cam angle in degrees 110 -> 100
@@ -103,12 +103,12 @@ pos_encode_freq = 16
 
 _pos_dim_ = 40
 _ffn_dim_ = numC_Trans * 4
-_num_heads_ = 4
+_num_heads_ = 8
 _num_levels_= 3
-_num_queries_=100
+_num_queries_= 200
 
 empty_idx = 0  # free class
-num_cls = 17  # 1-17 obj, 0 free
+num_cls = 18  # 1-17 obj, 0 free
 fix_void = True
 img_norm_cfg = None
 
@@ -127,14 +127,14 @@ model = dict(
     readd=True,
     pos_freq=pos_encode_freq,
     embed_dim=_dim_,
-    N_global_queries=_num_queries_,
+    num_queries=_num_queries_,
     attn_level=_num_levels_,
     grid_config = grid_config,
     num_head = _num_heads_,
     N_points = 50,
 
     img_backbone=dict(
-        pretrained='./ckpts/fbocc-r50-cbgs_depth_16f_16x4_20e.pth',
+        pretrained='./ckpts/r50_256x705_depth_pretrain.pth',
         type='ResNet',
         depth=50,
         num_stages=4,
@@ -173,7 +173,7 @@ model = dict(
         embed_dims=_dim_,
         num_heads=_num_heads_,
         num_levels=1,
-        num_points=8,
+        num_points=9,
         attn_layer='MultiScaleDeformableAttention', # DeformableSqueezeAttention for 3D attention, MultiScaleDeformableAttention for 2D
         grid_config=grid_config,
         data_config=data_config,
@@ -192,7 +192,7 @@ model = dict(
         embed_dims=_dim_,
         num_heads=_num_heads_,
         num_levels=1,
-        num_points=8,
+        num_points=9,
         attn_layer='MultiScaleDeformableAttention', # DeformableSqueezeAttention for 3D attention, MultiScaleDeformableAttention for 2D
         grid_config=grid_config,
         data_config=data_config,
@@ -233,33 +233,38 @@ model = dict(
     #     mlp_ratio=2
     # ),
 
-    # fcn_dw_encoder=dict(
-    #     type='BEV2DFCN',
-    #     flatten_height=False,
-    #     height=occ_h,
-    #     in_channels = None,
-    #     mid_channels= _dim_,
-    #     h_level=[4, 8, 16],
-    #     out_channels = _dim_,
-    # ),
+    fcn_dw_encoder=dict(
+        type='BEV2DFCN',
+        in_channels = _dim_,
+        dw_kernel_size = [4, 4],
+        dw_stride = [2, 2],
+        dw_pad = [1, 1],
+        uw_kernel_size = [3, 3],
+        uw_stride = [1, 1],
+        uw_pad = [1, 1],
+    ),
 
-    # fcn_dh_encoder=dict(
-    #     type='BEV2DFCN',
-    #     flatten_height=False,
-    #     height=occ_h,
-    #     in_channels = None,
-    #     mid_channels= _dim_,
-    #     out_channels = _dim_,
-    # ),
+    fcn_dh_encoder=dict(
+        type='BEV2DFCN',
+        in_channels = _dim_,
+        dw_kernel_size = [4, 2],
+        dw_stride = [2, 2],
+        dw_pad = [1, 0],
+        uw_kernel_size = [5, 3],
+        uw_stride = [1, 1],
+        uw_pad = [2, 1],
+    ),
 
-    # fcn_wh_encoder=dict(
-    #     type='BEV2DFCN',
-    #     flatten_height=False,
-    #     height=occ_h,
-    #     in_channels = None,
-    #     mid_channels= _dim_,
-    #     out_channels = _dim_,
-    # ),
+    fcn_wh_encoder=dict(
+        type='BEV2DFCN',
+        in_channels = _dim_,
+        dw_kernel_size = [4, 2],
+        dw_stride = [2, 2],
+        dw_pad = [1, 0],
+        uw_kernel_size = [5, 3],
+        uw_stride = [1, 1],
+        uw_pad = [2, 1],
+    ),
 
     backward_projection=None,
 
@@ -280,7 +285,7 @@ model = dict(
             loss_cos_sim_weight=1.0,
             loss_voxel_ce_weight=0.5,
             loss_voxel_sem_scal_weight=1.0,
-            loss_voxel_geo_scal_weight=2.0,
+            loss_voxel_geo_scal_weight=1.0,
             loss_voxel_lovasz_weight=1.0,
             loss_feature_alignment_weight=1.0,
             loss_query_div_weight=1.0,
@@ -373,7 +378,7 @@ share_data_config = dict(
 test_data_config = dict(
     pipeline=test_pipeline,
     sequences_split_num=test_sequences_split_num,
-    ann_file=data_root + 'overfit-nuscenes_infos.pkl')#'bevdetv2-nuscenes_infos_val.pkl')# overfit-nuscenes_infos.pkl
+    ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl')#'bevdetv2-nuscenes_infos_val.pkl')# overfit-nuscenes_infos.pkl
 
 data = dict(
     samples_per_gpu=samples_per_gpu,
@@ -382,7 +387,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'overfit-nuscenes_infos.pkl',#'bevdetv2-nuscenes_infos_train.pkl', # half_scene_train.pkl, overfit-nuscenes_infos.pkl
+        ann_file=data_root + 'bevdetv2-nuscenes_infos_train.pkl',#'bevdetv2-nuscenes_infos_train.pkl', # half_scene_train.pkl, overfit-nuscenes_infos.pkl
         pipeline=train_pipeline,
         classes=class_names,
         test_mode=False,
@@ -409,8 +414,8 @@ optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
 lr_config = dict(
     policy='step',
     warmup='linear',
-    warmup_iters=num_iters_per_epoch,
-    warmup_ratio=0.01,
+    warmup_iters=num_iters_per_epoch // 10,
+    warmup_ratio=0.05,
     step=[num_iters_per_epoch * 4, num_iters_per_epoch * 8, num_iters_per_epoch * 12],
     gamma=0.8)
 runner = dict(type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
