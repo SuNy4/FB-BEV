@@ -6,10 +6,10 @@
 
 
 # we follow the online training settings  from solofusion
-num_gpus = 2
-samples_per_gpu = 32
-num_iters_per_epoch = int(28130 // (num_gpus * samples_per_gpu) * 4.554) # full scene: 28130, single scene: 40 
-num_epochs = 20
+num_gpus = 3
+samples_per_gpu = 10
+num_iters_per_epoch = int(28130 // (num_gpus * samples_per_gpu) * 4.554) # full scene: 28130, single scene: 161 
+num_epochs = 40
 checkpoint_epoch_interval = 1
 use_custom_eval_hook = True
 
@@ -19,7 +19,7 @@ use_custom_eval_hook = True
 # lowering performance. To increase diversity, we split each training sequence
 # in half to ~20 keyframes, and sample these shorter sequences during training.
 # During testing, we do not do this splitting.
-train_sequences_split_num = 8
+train_sequences_split_num = 2
 test_sequences_split_num = 1
 
 # By default, 3D detection datasets randomly choose another sample if there is
@@ -110,10 +110,12 @@ occ_size = [200, 200, 16]
 voxel_out_indices = (0, 1, 2)
 voxel_out_channel = 256
 voxel_channels = [64, 64*2, 64*4]
-freeze_depthnet_components = True
+freeze_backbone_components = True
+freeze_depthnet_components = False
+
 model = dict(
     type='FBOCC',
-    use_depth_supervision=False,
+    use_depth_supervision=True,
     fix_void=fix_void,
     do_history = do_history,
     #history_cat_num=history_cat_num,
@@ -167,13 +169,13 @@ model = dict(
     #     forward_channel=numC_Trans
     # ),
 
-    bev_fcn_encoder=dict(
-        type='BEV2DFCN',
-        flatten_height=True,
-        height=occ_h,
-        in_channels =numC_Trans,
-        out_channels=_dim_
-    ),
+    # bev_fcn_encoder=dict(
+    #     type='BEV2DFCN',
+    #     flatten_height=True,
+    #     height=occ_h,
+    #     in_channels =numC_Trans,
+    #     out_channels=_dim_
+    # ),
 
     inst_pos_embed=dict(
         type='LearnableSqueezePositionalEncoding',
@@ -192,29 +194,29 @@ model = dict(
         data_config=data_config,
     ),
 
-    deform_cross_attn=dict(
-        type='DeformableTransformerLayer',
-        embed_dims=_dim_,
-        num_heads=_num_heads_,
-        num_levels=1,
-        num_points=12,
-        #attn_layer='DeformableSqueezeAttention',
-        grid_config=grid_config,
-        data_config=data_config,
-    ),
+    # deform_cross_attn=dict(
+    #     type='DeformableTransformerLayer',
+    #     embed_dims=_dim_,
+    #     num_heads=_num_heads_,
+    #     num_levels=1,
+    #     num_points=12,
+    #     #attn_layer='DeformableSqueezeAttention',
+    #     grid_config=grid_config,
+    #     data_config=data_config,
+    # ),
 
-    bev_pos_embed=dict(
-        type='LearnableSqueezePositionalEncoding',
-        num_embeds=[100, 100],
-        embed_dims=_dim_,
-        squeeze_dims=[1, 1]
-    ),
+    # bev_pos_embed=dict(
+    #     type='LearnableSqueezePositionalEncoding',
+    #     num_embeds=[100, 100],
+    #     embed_dims=_dim_,
+    #     squeeze_dims=[1, 1]
+    # ),
 
     bev_inst_feat_cross_attn=dict(
         type='TransformerLayer',
-        embed_dims=_dim_,
+        embed_dims=256,
         num_heads=_num_heads_,
-        mlp_ratio=0
+        mlp_ratio=2
     ),
 
     # bev_inst_h_cross_attn=dict(
@@ -360,7 +362,7 @@ data = dict(
     train=dict(
         type=dataset_type,
         data_root=data_root,
-        ann_file=data_root + 'bevdetv2-nuscenes_infos_val.pkl',#'single_scene_train.pkl')
+        ann_file=data_root + 'bevdetv2-nuscenes_infos_train.pkl',#'single_scene_train.pkl')
         pipeline=train_pipeline,
         classes=class_names,
         test_mode=False,
@@ -387,14 +389,15 @@ optimizer_config = dict(grad_clip=dict(max_norm=5, norm_type=2))
 lr_config = dict(
     policy='step',
     warmup='linear',
-    warmup_iters=200,
+    warmup_iters=100,
     warmup_ratio=0.001,
-    step=[num_iters_per_epoch*num_epochs,])
+    step=[num_iters_per_epoch * 2, num_iters_per_epoch * 4, num_iters_per_epoch * 6],
+    gamma=0.7)
 runner = dict(type='IterBasedRunner', max_iters=num_epochs * num_iters_per_epoch)
 checkpoint_config = dict(
     interval=checkpoint_epoch_interval * num_iters_per_epoch)
 evaluation = dict(
-    interval=20 * num_iters_per_epoch, pipeline=test_pipeline)
+    interval= 20*num_iters_per_epoch, pipeline=test_pipeline)
 
 
 log_config = dict(
@@ -414,5 +417,5 @@ custom_hooks = [
         temporal_start_iter=num_iters_per_epoch *2,
     ),
 ]
-load_from = './ckpts/depthnet_pretrained.pth'#'/home/sungjin/codes/FB-BEV/work_dirs/FIOcc/iter_800.pth'
+load_from = './work_dirs/FIOcc_2nd/iter_6402_ema_epoch_8.pth'#'/home/sungjin/codes/FB-BEV/work_dirs/FIOcc/iter_800.pth'
 #fp16 = dict(loss_scale='dynamic')

@@ -26,6 +26,7 @@ class TransformerLayer(nn.Module):
         self.norm2 = norm_layer(embed_dims)
         self.ffn = nn.Sequential(
             nn.Linear(embed_dims, embed_dims * mlp_ratio),
+            nn.LayerNorm(embed_dims * mlp_ratio),
             nn.GELU(),
             nn.Linear(embed_dims * mlp_ratio, embed_dims),
         )
@@ -66,7 +67,7 @@ class DeformableTransformerLayer(nn.Module):
         self.y_bound = grid_config['y']
         self.z_bound = grid_config['z']
         self.embed_dims = embed_dims
-        self.norm1 = norm_layer(embed_dims)
+        # self.norm1 = norm_layer(embed_dims)
         if isinstance(attn_layer, str):
             if attn_layer == 'DeformableSqueezeAttention':
                 attn_layer = DeformableSqueezeAttention
@@ -82,6 +83,7 @@ class DeformableTransformerLayer(nn.Module):
         self.norm2 = norm_layer(embed_dims)
         self.ffn = nn.Sequential(
             nn.Linear(embed_dims, embed_dims * mlp_ratio),
+            nn.LayerNorm(embed_dims * mlp_ratio),
             nn.GELU(),
             nn.Linear(embed_dims * mlp_ratio, embed_dims),
         )
@@ -213,12 +215,15 @@ class DeformableTransformerLayer(nn.Module):
 
             indexes = [[] for _ in range(bs)]
 
-            wrld_ref_3d = self.get_reference_points(
-                coords=ref_pts,
-                dim='2d', 
-                device='cuda', 
-                dtype=torch.float
-                )
+            # wrld_ref_3d = self.get_reference_points(
+            #     coords=ref_pts,
+            #     dim='2d', 
+            #     device='cuda', 
+            #     dtype=torch.float
+            #     )
+
+            wrld_ref_3d = ref_pts
+            
             voxel_ref_3d=None
             
             # voxel_ref_3d = self.get_reference_points(
@@ -279,9 +284,9 @@ class DeformableTransformerLayer(nn.Module):
 
         if occ_value:
             ref_pts = ref_pts.unsqueeze(2).repeat(1, 1, self.num_levels, 1)
-            
+        
         query = query + self.attn(
-            self.norm1(query),
+            query=query,
             value=value,
             query_pos=query_pos,
             reference_points=ref_pts,

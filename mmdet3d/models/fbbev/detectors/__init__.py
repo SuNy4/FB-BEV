@@ -1,2 +1,2 @@
 
-from .fbocc import FBOCC
+from .fbocc_decom_2 import FBOCC

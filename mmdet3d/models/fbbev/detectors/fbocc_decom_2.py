@@ -64,7 +64,7 @@ class FBOCC(CenterPoint):
                  bev_fcn3d_encoder=None,
 
                  occ_self_attn=None,
-                 keypoint=None,
+                 keypoint=80,
 
                  # BEVFormer components
                  backward_projection=None,
@@ -103,19 +103,25 @@ class FBOCC(CenterPoint):
 
         #FIOcc init
         # self.inst_pos_embed = builder.build_neck(inst_pos_embed) if inst_pos_embed else None
-        self.channel_weight = None #nn.Parameter(torch.randn(keypoint['forward_channel']), requires_grad=False) if keypoint else None
+        # self.channel_weight = nn.Embedding(keypoint, 1) if keypoint else None
         self.occ_self_attn = builder.build_neck(occ_self_attn) if occ_self_attn else None
-        self.bev_pos_embed = builder.build_neck(bev_pos_embed) if bev_pos_embed else None
+        # self.bev_pos_embed = builder.build_neck(bev_pos_embed) if bev_pos_embed else None
         # self.fc0 = nn.Linear(80, 1, device='cuda') if n_queries else None
         # self.fc1 = nn.Linear(256, 128, device='cuda') if keypoint else None
         # self.fc2 = nn.Linear(128, 80, device='cuda') if keypoint else None
         
         #######For old config##############
-        self.fc1 = nn.Linear(80, 40, device='cuda') if n_queries else None
-        self.fc2 = nn.Linear(40, 8, device='cuda') if n_queries else None
-
-        self.inst_queries = nn.Embedding(n_queries, embed_dim) if n_queries else None
-        self.inst_ref_pts = nn.Embedding(n_queries, 3) if n_queries else None#and keypoint == None else None
+        # self.fc1 = nn.Linear(80, 40, device='cuda') if n_queries else None
+        # self.fc2 = nn.Linear(40, 8, device='cuda') if n_queries else None
+        self.fc = nn.Sequential(
+            nn.Linear(256, 256*2),
+            nn.LayerNorm(256*2),
+            nn.GELU(),
+            nn.Linear(256*2, embed_dim*8),
+        )
+        self.n_queries = n_queries
+        # self.inst_queries = nn.Embedding(n_queries, embed_dim) if n_queries else None
+        # self.inst_ref_pts = nn.Embedding(n_queries, 3) if n_queries else None#and keypoint == None else None
         self.back_project = builder.build_neck(back_project) if back_project else None
         self.deform_cross_attn = builder.build_neck(deform_cross_attn) if deform_cross_attn else None
         self.bev_inst_h_cross_attn = builder.build_neck(bev_inst_h_cross_attn) if bev_inst_h_cross_attn else None
@@ -123,6 +129,25 @@ class FBOCC(CenterPoint):
         self.bev_fcn3d_encoder = builder.build_neck(bev_fcn3d_encoder) if bev_fcn3d_encoder else None
         self.bev_fcn_encoder = builder.build_neck(bev_fcn_encoder) if bev_fcn_encoder else None
         self.gelu = nn.GELU()
+
+        x_dim, y_dim, z_dim = 100, 100, 8
+        spacing = 0.8  # 간격
+
+        # 좌표 생성
+        x = torch.arange(-40, 40, spacing)  # x 좌표 (0부터 0.8 간격으로 100개)
+        y = torch.arange(-40, 40, spacing)  # y 좌표 (0부터 0.8 간격으로 100개)
+        z = torch.arange(-1, 5.4, spacing)  # z 좌표 (0부터 0.8 간격으로 8개)
+
+        # 3D meshgrid 생성
+        xx, yy, zz = torch.meshgrid(x, y, z, indexing="ij")  # (x, y, z) 순서로 meshgrid 생성
+
+        # 좌표를 4D 텐서로 병합
+        self.coords = torch.stack((xx, yy, zz), dim=-1).to('cuda')  # shape: (100, 100, 8, 3)
+
+        h = torch.arange(0, 16, 1)
+        w = torch.arange(0, 44, 1)
+        hh, ww = torch.meshgrid(h, w, indexing="ij")
+        self.pix_coords = torch.stack((hh, ww), dim=-1).to('cuda')
         # self.bev_2d_encoder_neck = builder.build_neck(bev_2d_encoder_neck) if bev_2d_encoder_neck else None   
         # print("encoder_neck_complete")
         # self.bev_2d_encoder_backbone = builder.build_backbone(bev_2d_encoder_backbone) if bev_2d_encoder_backbone else None
@@ -151,6 +176,18 @@ class FBOCC(CenterPoint):
         
         self.occupancy_save_path = occupancy_save_path # for saving data\for submitting to test server
 
+        self.height_encoder = nn.Sequential(
+            nn.Conv2d(in_channels=embed_dim*8, out_channels=256, kernel_size=1),
+            nn.BatchNorm2d(256),
+            nn.GELU(),
+            nn.Conv2d(in_channels=256, out_channels=256, kernel_size=3, stride=1, padding=1),
+        )
+        self.cam_encoder = nn.Sequential(
+            nn.Linear(embed_dim+27, 256),
+            nn.LayerNorm(256),
+            nn.GELU(),
+            nn.Linear(256, 256)
+        )
         # # Deal with history
         # self.single_bev_num_channels = single_bev_num_channels
         # self.do_history = do_history
@@ -376,97 +413,56 @@ class FBOCC(CenterPoint):
         # print(f"Img_encdoer_param: {total_params}")
         cam_params = img[1:7]
         if self.with_specific_component('depth_net'):
-            # t=time.time()
             mlp_input = self.depth_net.get_mlp_input(*cam_params)
-            context_depthnet, depth = self.depth_net(context, mlp_input)
-            # print(f"\nDepthNet time: {time.time()-t}")
-            # print(sum(p.numel() for p in self.depth_net.parameters() if p.requires_grad))
-            # total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-            # print(f"Depth_Net_Param: {total_params}")
+            context_depthnet, depth = self.depth_net(context, mlp_input) # bs, Ncam, C, H, W
+            bs, _, _, h, w = context_depthnet.shape
+
             return_map['depth'] = depth
             return_map['context'] = context_depthnet
-            # depth_save = depth.cpu().numpy()
-            # np.save('depth.npy', depth_save)
-            # assert False
         else:
             context=None
             depth=None
         
         if self.with_specific_component('forward_projection'):
             # t = time.time()
-            bev_feat = self.forward_projection(cam_params, context_depthnet, depth, **kwargs)
+            occ_feat = self.forward_projection(cam_params, context_depthnet, depth, **kwargs) # bs, C, D, W, H
+            occ_feat = occ_feat.permute(0, 2, 3, 4, 1) # bs, D, W, H, C
 
-            # # find occupied
-            # occupied = self.fc0(bev_feat.permute(0,2,3,4,1))
-            # occupied = self.gelu(occupied).sigmoid()
-
-            # print(f"\nForwardTime: {time.time()-t}")
-            # total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-            # print(f"Forward_Prjection_Param: {total_params}")
-            
-            # print(occ_feat.shape)
-            # np.save('occ_feature.npy', bev_feat.cpu().numpy())
-            # assert False
-
-            # occ_feat = bev_feat
             return_map['cam_params'] = cam_params
         else:
             bev_feat = None
-        
-        if self.channel_weight != None:
-            bs, _, D, W, H = occ_feat.shape
-            N = self.inst_queries.weight.shape[0]
-            weight_sum = (occ_feat * self.channel_weight.view(1, -1, 1, 1, 1)).sum(dim = 1)
+        bs, D, W, H, C = occ_feat.shape
+        # bs, C, D, W, H = occ_feat.shape
+        # occ_feat = occ_feat.permute(0, 2, 3, 4, 1) # bs, D, W, H, C
+        # # N = self.inst_queries.weight.shape[0]
+        # # channel_weight = self.channel_weight.weight
+        # # weight_sum = torch.matmul(occ_feat, channel_weight) # bs, D, W, H, 1
+        # weight_sum = torch.norm(occ_feat, dim=-1)
+        # weight_sum = weight_sum.flatten(start_dim=1, end_dim=3)
+        # topk_indices = weight_sum.topk(self.n_queries, dim=-1).indices # bs, 200
 
-            flatten_sum = weight_sum.flatten(1)
+        # coords = self.coords.flatten(start_dim=0, end_dim=2)
+        # keypoints = coords[topk_indices] # bs, N, 3
+        # inst_queries = occ_feat.flatten(start_dim=1, end_dim=3).gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, occ_feat.size(-1))) # bs, N, C
 
-            _, ranked_indices = torch.sort(flatten_sum, dim=-1, descending=True)
-    
-            top_indices = ranked_indices[:, :N]  # shape: [bs, k]
-
-            top_indices = top_indices % (D * W * H)
-            d_indices = top_indices // (W * H) 
-            w_indices = (top_indices % (W * H)) // H
-            h_indices = top_indices % H
-
-            keypoints = torch.stack([d_indices, w_indices, h_indices], dim=2)
-
-            norm_keypoints = keypoints.to(torch.float32)
-
-            # Normalize
-            norm_keypoints[..., 0] = keypoints[..., 0] / (D - 1)
-            norm_keypoints[..., 1] = keypoints[..., 1] / (W - 1)
-            norm_keypoints[..., 2] = keypoints[..., 2] / (H - 1)
-                
-        if self.with_specific_component('bev_fcn3d_encoder'):
-            # t=time.time()
-            bev_feat = [self.bev_fcn3d_encoder(bev_feat)]
-            # print(f"\n3DconvTime: {time.time()-t}")
+        context_depthnet = context_depthnet.flatten(0, 1).permute(0, 2, 3, 1) # bsN, C, H, W -> bsN, H, W, C
+        score = torch.norm(context_depthnet, dim=-1) # bsN, H, W
+        score = score.flatten(1, 2) # bsN, HW
+        topk_indices = score.topk(self.n_queries, dim=-1).indices # bsN, 100
+        coords = self.pix_coords.flatten(start_dim=0, end_dim=1) # HW, 2
+        keypoints = coords[topk_indices] # bs, N, 2
+        inst_queries = context_depthnet.flatten(1, 2).gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, context_depthnet.size(-1))) # bsN, 100, C
 
         if self.with_specific_component('bev_fcn_encoder'):
-            # bev_feat.shape = bs, c, D, W, H => bs, c*H, D, W => bs, c_out, D, W
-            bev_feat = bev_feat.permute(0, 4, 1, 2, 3).flatten(1, 2)
-            # print(f"bev_fcn_encoder: bev_feat = {bev_feat.shape}")
-            bev_feat = self.bev_fcn_encoder(bev_feat)
-            # total_params = sum(p.numel() for p in self.parameters() if p.requires_grad)
-            # print(f"FCN_Param: {total_params}")
-            # print(f"bev_fcn_encoder: bev_feat = {bev_feat.shape}")
-
-        if self.with_specific_component('frpn'): # not used in FB-OCC
-            bev_mask_logit = self.frpn(bev_feat)
-            bev_mask = bev_mask_logit.sigmoid() > self.frpn.mask_thre
-            
-            if bev_mask.requires_grad: # during training phase
-                gt_bev_mask = kwargs['gt_bev_mask'].to(torch.bool)
-                bev_mask = gt_bev_mask | bev_mask
-            return_map['bev_mask_logit'] = bev_mask_logit    
-        else:
-            bev_mask = None
+            # bev_feat.shape = bs, D, W, H, c => bs, D, W, H*c => bs, c_out, D, W
+            bev_feat = occ_feat.flatten(3, 4).permute(0, 3, 1, 2) #  bs, D, W, H*c => bs, H*c, D, W
+            bev_feat = self.bev_fcn_encoder(bev_feat) # bs, c, D, W
 
         ### back project for 2nd version FIOcc##############
         if self.with_specific_component('back_project'):
-
-            bs, _, _, h, w = context_depthnet.shape
+            
+            bev_feat = occ_feat.flatten(3, 4).permute(0, 3, 1, 2) #  bs, D, W, H*c => bs, H*c, D, W
+            bev_feat = self.height_encoder(bev_feat) # bs, 256, D, W
 
             spatial_shapes = []
             
@@ -478,214 +474,40 @@ class FBOCC(CenterPoint):
                 spatial_shapes, dtype=torch.long, device=context.device)
             level_start_index = torch.cat((spatial_shapes.new_zeros(
                 (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+            # inst_queries = self.inst_queries.weight.repeat(bs, 1, 1)
 
-            D = self.grid_config['x']
-            D = int((D[1] - D[0]) / D[-1])
-
-            W = self.grid_config['y']
-            W = int((W[1] - W[0]) / W[-1])
-
-            H = self.grid_config['z']
-            H = int((H[1] - H[0]) / H[-1])  
-
-            inst_queries = self.inst_queries.weight.repeat(bs, 1, 1)
-
-            if self.channel_weight is not None:
-                inst_ref_pts = keypoints
-            else:
-                inst_ref_pts = self.inst_ref_pts.weight.sigmoid()
-                inst_ref_pts = inst_ref_pts.unsqueeze(0).repeat(bs, 1, 1)
-
-            # inst_pos = self.inst_pos_embed().repeat(bs, 1, 1)
-            #ref_3d = self.ref_3d.weight.repeat(bs, 1, 1).sigmoid()
-            # context_flatten = context.permute(0, 2, 3, 1, 4).flatten(3, 4)
-            # _, _, H, W = context_flatten.shape
-            # context_flatten = context_flatten.flatten(2, 3).permute(0, 2, 1)
-
-            inst_queries, voxel_ref_3d = self.back_project(
-                inst_queries,
-                context_depthnet,
-                #query_pos = inst_pos,
-                ref_pts = inst_ref_pts,
-                img_value = True,
+            # if self.channel_weight is not None:
+            inst_ref_pts = keypoints # bs, N, 2
+            # else:
+            #     inst_ref_pts = self.inst_ref_pts.weight.sigmoid()
+            #     inst_ref_pts = inst_ref_pts.unsqueeze(0).repeat(bs, 1, 1)
+            inst_queries = self.back_project(
+                inst_queries, # bsNcam, 100, C
+                context_depthnet.flatten(1, 2), # bsNcam, HW, C
+                ref_pts = inst_ref_pts, # bsNcam, 100, 2
                 spatial_shapes = spatial_shapes,
                 level_start_index = level_start_index,
-                cam_params = cam_params,
-            )
-
-        # ###############back project for FIOcc_1st, named defrom_Cross attn###########
-        # if self.with_specific_component('deform_cross_attn'):
-
-        #     bs, _, _, h, w = context_depthnet.shape
-
-        #     spatial_shapes = []
-            
-        #     spatial_shape = (h, w)
-        #     # feat_flatten = context.flatten(3).permute(1, 0, 3, 2)
-        #     spatial_shapes.append(spatial_shape)
-
-        #     spatial_shapes = torch.as_tensor(
-        #         spatial_shapes, dtype=torch.long, device=context.device)
-        #     level_start_index = torch.cat((spatial_shapes.new_zeros(
-        #         (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
-
-        #     D = self.grid_config['x']
-        #     D = int((D[1] - D[0]) / D[-1])
-
-        #     W = self.grid_config['y']
-        #     W = int((W[1] - W[0]) / W[-1])
-
-        #     H = self.grid_config['z']
-        #     H = int((H[1] - H[0]) / H[-1])  
-
-        #     inst_queries = self.inst_queries.weight.repeat(bs, 1, 1)
-
-        #     if self.channel_weight is not None:
-        #         inst_ref_pts = keypoints
-        #     else:
-        #         inst_ref_pts = self.inst_ref_pts.weight.sigmoid()
-        #         inst_ref_pts = inst_ref_pts.unsqueeze(0).repeat(bs, 1, 1)
-
-        #     # inst_pos = self.inst_pos_embed().repeat(bs, 1, 1)
-        #     #ref_3d = self.ref_3d.weight.repeat(bs, 1, 1).sigmoid()
-        #     # context_flatten = context.permute(0, 2, 3, 1, 4).flatten(3, 4)
-        #     # _, _, H, W = context_flatten.shape
-        #     # context_flatten = context_flatten.flatten(2, 3).permute(0, 2, 1)
-
-        #     inst_queries, voxel_ref_3d = self.deform_cross_attn(
-        #         inst_queries,
-        #         context_depthnet,
-        #         #query_pos = inst_pos,
-        #         ref_pts = inst_ref_pts,
-        #         img_value = True,
-        #         spatial_shapes = spatial_shapes,
-        #         level_start_index = level_start_index,
-        #         cam_params = cam_params,
-        #     )
-            
-        ######back project for pointocc#######################
-        # if self.with_specific_component('back_project'):
-
-        #     bs, num_cam, c, h, w = context.shape
-
-        #     spatial_shapes = []
-            
-        #     spatial_shape = (h, w)
-        #     # feat_flatten = context.flatten(3).permute(1, 0, 3, 2)
-        #     spatial_shapes.append(spatial_shape)
-
-        #     spatial_shapes = torch.as_tensor(
-        #         spatial_shapes, dtype=torch.long, device=context.device)
-        #     level_start_index = torch.cat((spatial_shapes.new_zeros(
-        #         (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
-
-        #     D = self.grid_config['x']
-        #     D = int((D[1] - D[0]) / D[-1])
-
-        #     W = self.grid_config['y']
-        #     W = int((W[1] - W[0]) / W[-1])
-
-        #     H = self.grid_config['z']
-        #     H = int((H[1] - H[0]) / H[-1])  
-
-        #     inst_queries = self.inst_queries.weight.repeat(bs, 1, 1)
-
-        #     if self.channel_weight != None:
-        #         inst_ref_pts = norm_keypoints
-        #     else:
-        #         inst_ref_pts = self.inst_ref_pts.weight.sigmoid().clone()
-        #         #inst_ref_pts = inst_ref_pts.unsqueeze(0).repeat(bs, 1, 1)
-
-        #     # inst_pos = self.inst_pos_embed().repeat(bs, 1, 1)
-        #     #ref_3d = self.ref_3d.weight.repeat(bs, 1, 1).sigmoid()
-        #     # context_flatten = context.permute(0, 2, 3, 1, 4).flatten(3, 4)
-        #     # _, _, H, W = context_flatten.shape
-        #     # context_flatten = context_flatten.flatten(2, 3).permute(0, 2, 1)
-
-        #     inst_queries, voxel_ref_3d = self.back_project(
-        #         inst_queries,
-        #         context,
-        #         ref_pts = inst_ref_pts.unsqueeze(0).repeat(bs, 1, 1),
-        #         img_value = True,
-        #         spatial_shapes = spatial_shapes,
-        #         level_start_index = level_start_index,
-        #         cam_params = cam_params,
-        #         occ_size = [D, W, H]
-        #     )
-            
-        #     # inst queries: bs, N, 256
-        #     # ref pts: bs, N, 3
-        #     # inst_feat: bs, D, W, H, C
-        #     inst_feat = torch.zeros(bs, D, W, H, inst_queries.shape[-1], device=occ_feat.device)
-        #     d_indices = (inst_ref_pts[:, 0]*100).long()
-        #     w_indices = (inst_ref_pts[:, 1]*100).long()
-        #     h_indices = (inst_ref_pts[:, 2]*8).long()
-        #     for i in range(bs):
-        #         # d_indices = keypoints[i, :, 0]
-        #         # w_indices = keypoints[i, :, 1]
-        #         # h_indices = keypoints[i, :, 2]
-        #         inst_feat[i, d_indices, w_indices, h_indices] = inst_queries[i]
-        #     inst_feat = inst_feat.permute(0, 4, 1, 2, 3) # bs, D, W, H, C, -> bs, C, D, W, H
-
-        if self.with_specific_component('occ_self_attn'):
-            maxpool = nn.MaxPool3d(kernel_size=3, stride=2, padding=1)
-            # avgpool = nn.AvgPool3d(kernel_size=3, stride=2, padding=1)
-            upsample = nn.Upsample(scale_factor=2, mode='trilinear', align_corners=True)
-    
-            bs, c, d, w, h = occ_feat.shape
-            norm = nn.BatchNorm3d(c, device='cuda')
-
-            inst_feat = maxpool(inst_feat) # inst feat: bs, c, d, w, h
-            inst_feat = maxpool(inst_feat)
-            inst_feat = upsample(inst_feat)
-            inst_feat = upsample(inst_feat)
-
-            inst_feat = (self.gelu(self.fc1(inst_feat.flatten(2))).permute(0, 2, 1)) # inst feat: bs, dwh, c
-            inst_feat = (self.gelu(self.fc2(inst_feat))).permute(0, 2, 1).reshape(bs, c, d, w, h)
-
-            spatial_shapes = []
-            
-            spatial_shape = (int(d/2), int(w/2), int(h/2))
-            spatial_shapes.append(spatial_shape)
-
-            spatial_shapes = torch.as_tensor(
-                spatial_shapes, dtype=torch.long, device=context.device)
-            level_start_index = torch.cat((spatial_shapes.new_zeros(
-                (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
-            
-            occ_feat = norm(occ_feat + inst_feat)
-            occ_feat = maxpool(occ_feat).flatten(2).permute(0, 2, 1) # bs, seq, C
-
-            occ_pos = self.bev_pos_embed().repeat(bs, 1, 1)
-
-            depth, width, height = d/2, w/2, h/2
-            x_coords = torch.arange(depth, dtype=torch.float32)
-            y_coords = torch.arange(width, dtype=torch.float32)
-            z_coords = torch.arange(height, dtype=torch.float32)
-            x_grid, y_grid, z_grid = torch.meshgrid(x_coords, y_coords, z_coords, indexing='ij')
-            ref_pts = torch.stack([x_grid, y_grid, z_grid], dim=-1).reshape(-1, 3)\
-                .unsqueeze(0).repeat(bs, 1, 1).to(occ_feat.device)
-            
-            for _ in range(3):
-                occ_feat = self.occ_self_attn(
-                    occ_feat,
-                    occ_feat,
-                    query_pos = occ_pos,
-                    ref_pts = ref_pts,
-                    occ_value = True,
-                    spatial_shapes = spatial_shapes,
-                    level_start_index = level_start_index,
-                    cam_params = cam_params,
-                    occ_size = [D, W, H]
-                )
-            
-            occ_feat = occ_feat.permute(0, 2, 1).reshape(bs, c, int(d/2), int(w/2), int(h/2)) 
-            bev_feat = [upsample(occ_feat)] # bs, C, D, W, H
+                occ_value = True
+            ) # bsNcam, N, 80
+            mlp_input = mlp_input.unsqueeze(-2).repeat(1, 1, self.n_queries, 1) # bs, Ncam, 27 => bs, Ncam, Nqueries, 27
+            mlp_input = mlp_input.flatten(0, 1) # bsNcam, Nqueries, 27
+            inst_queries = torch.cat([inst_queries, mlp_input], dim=-1)
+            inst_queries = self.cam_encoder(inst_queries) # bsNcam, Nqueries, C
+            inst_queries = inst_queries.reshape(bs, -1, self.n_queries, 256).flatten(1, 2) # bs, NcamNqueries, 256
+            # inst_queries, voxel_ref_3d = self.back_project(
+            #     inst_queries, # bsNcam, 100, C
+            #     context_depthnet, # bsNcam, H, W, C
+            #     #query_pos = inst_pos,
+            #     ref_pts = inst_ref_pts,
+            #     img_value = True,
+            #     spatial_shapes = spatial_shapes,
+            #     level_start_index = level_start_index,
+            #     cam_params = cam_params,
+            # ) # bs, N, c
         
         ####### 2nd version FIOcc bev_inst_attn##############
         if self.with_specific_component('bev_inst_feat_cross_attn'):
-            
-            bev_pos = self.bev_pos_embed().repeat(bs, 1, 1)
+            # bev_pos = self.bev_pos_embed().repeat(bs, 1, 1)
 
             spatial_shapes = []
 
@@ -699,47 +521,51 @@ class FBOCC(CenterPoint):
             level_start_index = torch.cat((spatial_shapes.new_zeros(
                 (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
 
-            bev_feat = bev_feat.flatten(2).permute(0, 2, 1)
+            bev_feat = bev_feat.flatten(2, 3).permute(0, 2, 1) # bs, DW, c
             # print(f"bev_inst_cross_attn: bev_feat = {bev_feat.shape}")
 
-            for level in range(self.num_levels):
-                bev_feat_que = self.bev_inst_feat_cross_attn(
-                    bev_feat,
-                    inst_queries,
-                    inst_queries,
-                    query_pos = bev_pos,
+            for _ in range(self.num_levels):
+                bev_feat = self.bev_inst_feat_cross_attn(
+                    query=bev_feat,
+                    key=inst_queries,
+                    value=inst_queries,
+                    # query_pos = bev_pos,
                     # key_pos = inst_pos,
-                )
+                ) # bs, DW, C
 
-                inst_queries = self.deform_cross_attn(
-                    inst_queries,
-                    bev_feat,
-                    ref_pts = inst_ref_pts,
-                    bev_value = True,
-                    spatial_shapes = spatial_shapes,
-                    level_start_index = level_start_index,
-                    )
+                # inst_queries = self.deform_cross_attn(
+                #     inst_queries,
+                #     bev_feat,
+                #     ref_pts = inst_ref_pts,
+                #     bev_value = True,
+                #     spatial_shapes = spatial_shapes,
+                #     level_start_index = level_start_index,
+                #     )
                 
-                bev_feat = bev_feat_que
+                # bev_feat = bev_feat_que
 
-            inst_height = self.gelu(self.fc1(inst_queries))
-            inst_height = self.gelu(self.fc2(inst_height))
-            
+            # inst_height = self.gelu(self.fc1(inst_queries))
+            # inst_height = self.gelu(self.fc2(inst_height))
+            occ_feat_inst = self.fc(bev_feat)
             # bev feature: bs, 10000, C
             # inst queries: bs, 100, C
             # inst height: bs, 100, H
+            occ_feat_inst = occ_feat_inst.reshape(bs, D, W, H, C) # bs, D, W, H, C
 
-            result = torch.matmul(bev_feat, inst_queries.transpose(-1, -2))
-            result = torch.matmul(result, inst_height).reshape(bs, D, W, -1).unsqueeze(-1)
-            bev_feat = bev_feat.reshape(bs, D, W, -1).unsqueeze(3)
+            # result = torch.matmul(bev_feat, inst_queries.transpose(-1, -2))
+            # result = torch.matmul(result, inst_height).reshape(bs, D, W, -1).unsqueeze(-1)
+            # bev_feat = bev_feat.reshape(bs, D, W, -1).unsqueeze(3)
 
-            result = result * bev_feat  # Result: bs, D, W, H, C
+            # result = result * bev_feat  # Result: bs, D, W, H, C
 
             # print(f"Channel_to_height: inst_queries = {inst_queries.shape}")
             # print(f"Channel_to_height: inst_height = {inst_height.shape}")
             # occ = torch.cat([bev_feat, bev_height], dim=-1)
+            # result = occ_feat + occ_feat_inst
+            result = occ_feat_inst# + occ_feat
+            result = result.permute(0, 4, 1, 2, 3)
 
-            bev_feat = [result.permute(0, 4, 1, 2, 3)] # bs, C, D, W, H
+            bev_feat = [result] # bs, C, D, W, H
 
         ################3rd version FIOcc bev_inst_attn(3D query 50 50 4) ########################################################
         # if self.with_specific_component('bev_inst_feat_cross_attn'):
@@ -836,21 +662,6 @@ class FBOCC(CenterPoint):
         #     bev_feat = [result.permute(0, 4, 1, 2, 3)] # bs, C, D, W, H
 
 #######################################################################################################
-        if self.with_specific_component('backward_projection'):
-
-            bev_feat_refined = self.backward_projection([context],
-                                        img_metas,
-                                        lss_bev=bev_feat.mean(-1),
-                                        cam_params=cam_params,
-                                        bev_mask=bev_mask,
-                                        gt_bboxes_3d=None, # debug
-                                        pred_img_depth=depth)  
-                                        
-            if self.readd:
-                bev_feat = bev_feat_refined[..., None] + bev_feat
-            else:
-                bev_feat = bev_feat_refined
-
         # Fuse History
         # bev_feat = self.fuse_history(bev_feat, img_metas, img[6])
         

@@ -43,21 +43,23 @@ class BEV2DFCN(nn.Module):
         self.flatten_height = flatten_height
         self.in_channels = in_channels
         # self.conv0 = nn.Conv2d(self.in_channels*height, self.in_channels, kernel_size=1)
-        self.conv1 = nn.Conv2d(self.in_channels*height, out_channels, kernel_size=1)
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(self.in_channels*height, out_channels*3, kernel_size=1),
+            nn.Conv2d(out_channels*3, out_channels, kernel_size=1))
         # self.bn_flat0 = nn.BatchNorm2d(self.in_channels*height/2)
         self.bn_flat1 = nn.BatchNorm2d(out_channels)
         self.gelu = nn.GELU()
         self.maxpool = nn.MaxPool2d(kernel_size=3, stride=2, padding=1)
-        self.decoder1 = UpsampleLayer(2, 'bilinear', out_channels, out_channels, convtype='2d')
-        self.decoder2 = UpsampleLayer(2, 'bilinear', out_channels, out_channels, convtype='2d')
-        # self.encoder1 = AggregationBlock(out_channels, out_channels*2)
-        # self.encoder2 = AggregationBlock(out_channels*2, out_channels*4)
+        self.decoder1 = UpsampleLayer(2, 'bilinear', out_channels*4, out_channels*2, convtype='2d')
+        self.decoder2 = UpsampleLayer(2, 'bilinear', out_channels*2, out_channels, convtype='2d')
+        self.encoder1 = AggregationBlock(out_channels, out_channels*2)
+        self.encoder2 = AggregationBlock(out_channels*2, out_channels*4)
         
         # self.decoder1 = nn.ConvTranspose2d(out_channels*4, out_channels*2, padding=1, kernel_size=4, stride=2)
         # self.decoder2 = nn.ConvTranspose2d(out_channels*2, out_channels, padding=1, kernel_size=4, stride=2)
         
         # Batch Normalization
-        self.bn1 = nn.BatchNorm2d(out_channels)
+        self.bn1 = nn.BatchNorm2d(out_channels*2)
         self.bn2 = nn.BatchNorm2d(out_channels)
 
     def forward(self, x):
@@ -67,10 +69,10 @@ class BEV2DFCN(nn.Module):
             x = self.gelu(x)
         
         # Downsample
-        # e1 = self.encoder1(x)
-        # e2 = self.encoder2(e1)
-        e1 = self.maxpool(x)
-        e2 = self.maxpool(e1)
+        e1 = self.encoder1(x)
+        e2 = self.encoder2(e1) # bs, embed_dim*4, D/4, H/4
+        # e1 = self.maxpool(x)
+        # e2 = self.maxpool(e1)
 
         # Upsample
         d1 = self.gelu(self.bn1(self.decoder1(e2)))

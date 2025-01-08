@@ -261,7 +261,7 @@ def main():
 
 
 
-    if 'freeze_depthnet_components' in cfg and cfg['freeze_depthnet_components'] is True:
+    if 'freeze_backbone_components' in cfg and cfg['freeze_backbone_components'] is True:
         from torch import nn
         def fix_bn_16(m):
             if isinstance(m, nn.BatchNorm1d) or isinstance(m, nn.BatchNorm2d) or isinstance(m, nn.SyncBatchNorm):
@@ -277,6 +277,7 @@ def main():
         for param in model.img_neck.parameters():
             param.requires_grad = False
 
+    if 'freeze_depthnet_components' in cfg and cfg['freeze_depthnet_components'] is True:
         for param in model.depth_net.parameters():
             param.requires_grad = False
 
