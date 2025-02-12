@@ -14,6 +14,7 @@ from mmdet3d.ops.bev_pool_v2.bev_pool import TRTBEVPoolv2
 from mmdet.models import DETECTORS
 from mmdet3d.models import builder
 from mmdet3d.models.detectors import CenterPoint
+from mmdet.models.backbones.resnet import BasicBlock
 from mmdet3d.models.builder import build_head, build_neck
 import numpy as np
 import copy 
@@ -35,7 +36,8 @@ import time
 import torch.distributed as dist
 from collections import OrderedDict
 torch.autograd.set_detect_anomaly(True)
-
+from sklearn.cluster import KMeans
+from mmdet3d.models.fbbev.modules.occ_loss_utils.semkitti import auxiliary_loss
 def generate_forward_transformation_matrix(bda, img_meta_dict=None):
     b = bda.size(0)
     hom_res = torch.eye(4)[None].repeat(b, 1, 1).to(bda.device)
@@ -55,8 +57,8 @@ class QBON_v3(CenterPoint):
 
                  # Fast Instance Occ
                  pos_encoder = None,
-                 img_deform_self_attn=None,
-
+                 img_self_attn=None,
+                 img_shift_attn=None,
                  img_query_cross_attn=None,
                  query_img_cross_attn=None,
                  query_self_attn_local=None,
@@ -73,6 +75,7 @@ class QBON_v3(CenterPoint):
 
                  attn_level=None,
                  grid_config=None,
+                 data_config=None,
                  bev_fcn_encoder=None,
                  
                  occ_self_attn=None,
@@ -124,7 +127,8 @@ class QBON_v3(CenterPoint):
         # self.main_queries = nn.Embedding(N_global_queries, embed_dim) if N_global_queries else None
         # torch.nn.init.uniform_(self.main_queries.weight, a=-0.1, b=0.1)
         self.pos_encoder = builder.build_neck(pos_encoder) if pos_encoder else None
-        self.img_deform_self_attn = builder.build_neck(img_deform_self_attn) if img_deform_self_attn else None
+        self.img_self_attn = builder.build_neck(img_self_attn) if img_self_attn else None
+        self.img_shift_attn = builder.build_neck(img_shift_attn) if img_shift_attn else None
 
         self.img_query_cross_attn = builder.build_neck(img_query_cross_attn) if img_query_cross_attn else None
         self.query_img_cross_attn = builder.build_neck(query_img_cross_attn) if query_img_cross_attn else None
@@ -146,25 +150,63 @@ class QBON_v3(CenterPoint):
         # FC layer
         self.radius_range = torch.linspace(grid_config['radius'][0], grid_config['radius'][1], grid_config['radius'][2]).to('cuda')
 
-        self.radius_layer = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim*2),
-            nn.LayerNorm(embed_dim*2),
+        # self.radius_layer = nn.Sequential(
+        #     nn.Conv2d(in_channels=embed_dim, out_channels=embed_dim, kernel_size=3, stride=1, padding=1),
+        #     nn.BatchNorm2d(embed_dim),
+        #     nn.ReLU(),
+        #     )
+        self.relu = nn.ReLU()
+        self.reduce_conv = nn.Sequential(
+            nn.Conv2d(256, 256, kernel_size=5, stride=1, padding=2),
             nn.ReLU(),
-            nn.Linear(embed_dim*2, embed_dim*2),
-            nn.LayerNorm(embed_dim*2),
-            nn.ReLU(),
-            nn.Linear(embed_dim*2, grid_config['radius'][2])
-            )
+            nn.Conv2d(256, 256, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(256),
+        )
+
+        self.merge_conv = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=3, stride=1, padding=1),
+            nn.BatchNorm2d(512),
+            nn.ReLU()
+        )
         
-        self.semantic_layer = nn.Sequential(
-            nn.Linear(embed_dim, embed_dim*2),
-            nn.LayerNorm(embed_dim*2),
-            nn.ReLU(),
-            nn.Linear(embed_dim*2, embed_dim*2),
-            nn.LayerNorm(embed_dim*2),
-            nn.ReLU(),
-            nn.Linear(embed_dim*2, embed_dim)
+        depth_conv_list = [
+            BasicBlock(512, 512),
+            BasicBlock(512, 512),
+            BasicBlock(512, 512),
+        ]
+
+        self.depth_conv = nn.Sequential(*depth_conv_list)
+
+        self.depth_prediction_layer = nn.Sequential(
+            nn.Linear(512, grid_config['radius'][2])
             )
+        self.sem_prediction_layer = nn.Sequential(
+            nn.Linear(512, 256),
+            nn.LayerNorm(256),
+            nn.Linear(256, 18)
+        )
+        # self.pos_layer = nn.Sequential(
+        #     nn.Linear(27, 512),
+        #     nn.ReLU(),
+        #     nn.Linear(512, 512),
+        # )
+        # self.bn = nn.BatchNorm1d(27)
+        # self.se_layer = nn.Sequential(
+        #     nn.Conv2d(512, 512, kernel_size=1, stride=1, padding=0),
+        #     nn.ReLU(),
+        #     nn.Conv2d(512, 512, kernel_size=1, stride=1, padding=0),
+        #     nn.Sigmoid()
+        # )
+
+        # self.semantic_layer = nn.Sequential(
+        #     nn.Linear(embed_dim, embed_dim*2),
+        #     nn.LayerNorm(embed_dim*2),
+        #     nn.ReLU(),
+        #     nn.Linear(embed_dim*2, embed_dim*2),
+        #     nn.LayerNorm(embed_dim*2),
+        #     nn.ReLU(),
+        #     nn.Linear(embed_dim*2, embed_dim)
+        #     )
         
         # self.d_layer = nn.Sequential(
         #     nn.Linear(embed_dim, embed_dim*2),
@@ -244,7 +286,15 @@ class QBON_v3(CenterPoint):
         #     nn.ReLU(),
         #     nn.Linear(embed_dim*2, embed_dim),
         # )
+        ######## Hard Coded ######################
+        input_height, input_width = data_config['input_size']
 
+        u = torch.arange(0, (input_width)//16, dtype=torch.float32, device='cuda') * 16 * (1600 / 704)
+        v = (torch.arange(0, (input_height)//16, dtype=torch.float32, device='cuda') * 16 + 140) * (1600 / 704)
+        
+        u, v = torch.meshgrid(u, v, indexing='ij')
+        self.img_grid = torch.stack([u, v, torch.ones_like(u)], dim=-1)
+        ###########################################
         D = self.grid_config['shape'][0]
         W = self.grid_config['shape'][1]
         H = self.grid_config['shape'][2]
@@ -552,98 +602,216 @@ class QBON_v3(CenterPoint):
         return_map = {}
 
         context = self.image_encoder(img[0]).permute(0, 1, 2, 4, 3) # bs, Ncam, C, W, H
-
         cam_params = img[1:7] #rot, tran, intrin, post_rot, post_tran, bda: *cam_params
         
         # Local Image Pos Encode
-        if self.with_specific_component('pos_encoder'):
-            img_local_pos_encode = self.pos_encoder(context, *cam_params, mode='Local') # bs, Ncam, WH, num_freqs*4
-            img_local_pos_encode = img_local_pos_encode.flatten(0, 1) # bsNcam, WH, num_freqs*4
-            # img_local_pos_encode = self.fc_layer_1(img_local_pos_encode) # bsNcam, WH, C
+        # if self.with_specific_component('pos_encoder'):
+            # img_local_pos_encode = self.pos_encoder(context, *cam_params, mode='Local') # bs, Ncam, WH, num_freqs*4
+            # img_local_pos_encode = img_local_pos_encode.flatten(0, 1) # bsNcam, WH, num_freqs*4
 
-            img_global_pos_encode, img_grid, img_glob_sph = self.pos_encoder(context, *cam_params, mode='Global') # bs, Ncam, WH, num_freqs*4 // bs, Ncam, WH, 2 (W, H and theta, phi)
-            img_grid = img_grid.flatten(0, 1) # bsNcam, WH, 2
-            img_glob_sph = img_glob_sph.flatten(0, 1) # bsNcam, WH, 2
-            img_global_pos_encode = img_global_pos_encode.flatten(0, 1) # bsNcam, WH, num_freqs*4
-            # img_global_pos_encode = self.fc_layer_2(img_global_pos_encode) # bsNcam, WH, C
+            # img_global_pos_encode, img_grid, img_glob_sph = self.pos_encoder(context, *cam_params, mode='Global') # bs, Ncam, WH, num_freqs*4 // bs, Ncam, WH, 2 (W, H and theta, phi)
+            # img_grid = img_grid.flatten(0, 1) # bsNcam, WH, 2
+            
+            # return_map['img_glob_sph'] = img_glob_sph
+            
+            # img_glob_sph = img_glob_sph.flatten(0, 1) # bsNcam, WH, 2
+            # img_global_pos_encode = img_global_pos_encode.flatten(0, 1) # bsNcam, WH, num_freqs*4
 
-        if self.with_specific_component('query_img_cross_attn'):
-            bs, Ncam, C, W, H = context.shape
-            
-            context = context.flatten(-2, -1)
-            context = context.flatten(0, 1).permute(0, 2, 1) # bsNcam, WH, C
+        # if self.with_specific_component('img_deform_self_attn'):
+        bs, Ncam, C, W, H = context.shape
 
-            context = torch.cat([context, img_global_pos_encode], dim=-1) # bsNcam, WH, C + num_freq*4
-            
-            context = context.reshape(bs*Ncam, W, H, -1).permute(0, 3, 1, 2)
-            context = self.aspp_layer(context).flatten(2, 3).permute(0, 2, 1) # bsNcam, C, W, H -> bsNcam, WH, C
-            
-            # ##### Deformable Self Attention for Image ######
-            spatial_shapes = []
-            
-            spatial_shape = (W, H)
-            # feat_flatten = context.flatten(3).permute(1, 0, 3, 2)
-            spatial_shapes.append(spatial_shape)
+        context = context.flatten(-2, -1)
+        context = context.flatten(0, 1).permute(0, 2, 1) # bsNcam, WH, C
 
-            spatial_shapes = torch.as_tensor(
-                spatial_shapes, dtype=torch.long, device=context.device)
-            level_start_index = torch.cat((spatial_shapes.new_zeros(
-                (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+            # spatial_shapes = []
             
-            context = self.img_deform_self_attn(
-                context,
-                context,
-                ref_pts = img_grid,
-                spatial_shapes = spatial_shapes,
-                level_start_index = level_start_index,
-                cam_params = cam_params,
-            )
+            # spatial_shape = (W, H)
+            # spatial_shapes.append(spatial_shape)
+
+            # spatial_shapes = torch.as_tensor(
+            #     spatial_shapes, dtype=torch.long, device=context.device)
+            # level_start_index = torch.cat((spatial_shapes.new_zeros(
+            #     (1,)), spatial_shapes.prod(1).cumsum(0)[:-1]))
+            
+            # for _ in range(self.num_levels):
+            #     context = self.img_deform_self_attn(
+            #         context,
+            #         context,
+            #         ref_pts = img_grid,
+            #         spatial_shapes = spatial_shapes,
+            #         level_start_index = level_start_index,
+            #         cam_params = cam_params,
+            #     )  # bsNcam, WH, C
+        
+        
+        context = context.reshape(bs, Ncam, W, H, -1)#.permute(0, 3, 1, 2) # bsNcam, C, W, H
+        
+        identity = context.flatten(0, 1).permute(0, 3, 1, 2)
+        
+        swap_context = self.ol_mixer(context, self.img_grid, *cam_params)
+        swap_context = context.flatten(0, 1).permute(0, 3, 1, 2)
+        
+        swap_context = self.reduce_conv(swap_context)
+        
+        fused_context = swap_context + identity
+        # fused_context = self.relu(fused_context)
+
+        fused_context = self.merge_conv(fused_context)
+        
+
+        fused_context = self.depth_conv(fused_context)#.flatten(2, 3).permute(0, 2, 1)
+        
+        fused_context = self.aspp_layer(fused_context).flatten(2, 3).permute(0, 2, 1) # bsNcam, C, W, H -> bsNcam, WH, C
+        
+        
+        ###########################################
+        # fused_context, _ = self.img_self_attn(
+        #     query = fused_context,
+        #     query_pos = 
+        # ) # bsNcam, WH, C
+
+        # fused_context = fused_context.reshape(bs, Ncam, W*H, -1)
+        # shifted_fused_context = torch.roll(shifted_fused_context, shifts=1, dims=1)
+        # fused_context = fused_context.flatten(0, 1)
+        # shifted_fused_context = shifted_fused_context.flatten(0, 1)
+        
+        # fused_context, _ = self.img_shift_attn(
+        #     query = fused_context,
+        #     key = shifted_fused_context,
+        #     value = shifted_fused_context,
+        #     query_pos = 
+        # )
+        ############################################
+        # fused_context = fused_context.reshape(bs, Ncam, W, H, -1)
+
+        pred_depth = self.depth_prediction_layer(fused_context) # bs, NCam, W, H, 100
+        pred_sem = self.sem_prediction_layer(fused_context) # bs, Ncam, W, H, Cls
             ############################################################
-            scores = context.norm(dim = -1)
-            # scores = context.softmax(dim = -1)
-            # scores = scores.mean(dim=-1)
-            # mean_scores = context.mean(dim = -1)
-            # norm_scores = norm_scores / (norm_scores.max(dim=-1, keepdim=True)[0] + 1e-8)
-            # mean_scores = mean_scores / (mean_scores.max(dim=-1, keepdim=True)[0] + 1e-8)
-            # scores = norm_scores + mean_scores
+        '''
+        pred_depth: bs, Ncam, Depth, H, W
+        fused_context: bs, Ncam, C, H, W
+        Output: bev_feat(bs, C, 100, 100, 8)
+        '''
 
-            num_queries = self.num_queries
-            topk_indices = scores.topk(num_queries, dim=-1).indices
-            inst_queries = context.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, context.size(-1))) # bsNcam, N_queries, C
-            inst_queries_img_sph = img_glob_sph.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, img_glob_sph.size(-1))) # bsNcam, N_queries, 2
-            inst_queries_img_ref = img_grid.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, img_grid.size(-1))) # bsNcam, N_queries, 2
+        fused_context = fused_context.permute(0, 1, 4, 3, 2) # bs, Ncam, Depth, H, W
+        pred_depth = pred_depth.permute(0, 1, 4, 3, 2) # bs, Ncam, C, H, W
+        bev_feat = self.forward_projection(cam_params, fused_context, pred_depth, **kwargs)
+
+        print(bev_feat.shape)
+        assert False
+
+            ############################################################
+            # patches: bs, Ncam, C, W, H
+            # window = 4
+            # patch_size = (window, window)
+            # patches = patches.flatten(0, 1)
+            # patches = F.unfold(patches, kernel_size=patch_size, stride=patch_size) # bs*Ncam, C*kenelsize, L
+            # patches = patches.view(bs*Ncam, C, window*window, -1).permute(0, 3, 2, 1) # bs*Ncam, L, kernelsize, C
+
+            # norms = patches.norm(dim=-1)  # bsNcam, L, kenelsize)
+            # max_indices = torch.argmax(norms, dim=-1)  # (bsNcam, L)
+            # min_indices = torch.argmin(norms, dim=-1)  # (bsNcam, L)
+            # indices = torch.cat([max_indices, min_indices], dim=-1)
+
+            # grid_x, grid_y = torch.meshgrid(torch.arange(0, W, window, device=patches.device), 
+            #                                 torch.arange(0, H, window, device=patches.device))
+            # grid_x, grid_y = grid_x.flatten(), grid_y.flatten()
+            # ##
+            # grid_x = torch.cat([grid_x, grid_x])
+            # grid_y = torch.cat([grid_y, grid_y])
+            # ##
+            # selected_x = grid_x + indices // window
+            # selected_y = grid_y + indices % window
+
+            # inst_queries_img_ref = torch.stack((selected_x, selected_y), dim=-1) # bsNcam, L, 2
+            # print(inst_queries_img_ref)
+            # flat_indices = inst_queries_img_ref[:, :, 0]*H + inst_queries_img_ref[:, :, 1] # bsNcam, L
+
+            # inst_queries = context.gather(1, flat_indices.unsqueeze(-1).expand(-1, -1, context.size(-1)))
+            # pred_radius = context_rad.gather(1, flat_indices.unsqueeze(-1).expand(-1, -1, context_rad.size(-1))).detach()
+
+            ############################################################
+            # scores = context_flat.norm(dim = -1)
+            # # scores = context.softmax(dim = -1)
+            # # scores = scores.mean(dim=-1)
+            # # mean_scores = context.mean(dim = -1)
+            # # norm_scores = norm_scores / (norm_scores.max(dim=-1, keepdim=True)[0] + 1e-8)
+            # # mean_scores = mean_scores / (mean_scores.max(dim=-1, keepdim=True)[0] + 1e-8)
+            # # scores = norm_scores + mean_scores
+
+            # num_queries = self.num_queries
+            # topk_indices = scores.topk(num_queries, dim=-1).indices
+            # inst_queries = context.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, context.size(-1))) # bsNcam, N_queries, C
+            # pred_radius = context_rad.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, context_rad.size(-1))).detach()
+            # # inst_queries = context_rad.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, context.size(-1))) # bsNcam, N_queries, C
+            # inst_queries_img_sph = img_glob_sph.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, img_glob_sph.size(-1))) # bsNcam, N_queries, 2
+            # inst_queries_img_ref = img_grid.gather(1, topk_indices.unsqueeze(-1).expand(-1, -1, img_grid.size(-1))) # bsNcam, N_queries, 2
+            ##################################################################
+
+            # ref_pts=inst_queries_img_ref.cpu().numpy()
+            # np.save('norm_ref_pts.npy', ref_pts)
             
             # radius_gt = inst_queries_img_ref.to("cpu").numpy()
             # np.save('project_ref_points.npy', radius_gt)
             # assert False
 
-            return_map['cam_params'] = cam_params
-            return_map['pred_pixel_coords'] = inst_queries_img_ref
+            
+        return_map['cam_params'] = cam_params
+        #return_map['pred_pixel_coords'] = inst_queries_img_ref
 
-            ##### Deformable Cross Attention
-            for _ in range(self.num_levels):
-                inst_queries = self.query_img_cross_attn(
-                    inst_queries,
-                    context,
-                    ref_pts = inst_queries_img_ref,
-                    spatial_shapes = spatial_shapes,
-                    level_start_index = level_start_index,
-                    cam_params = cam_params,
-                ) # bsNcam, N_queries, C
+        ##### Deformable Cross Attention
+        # for _ in range(self.num_levels):
+        #     inst_queries = self.query_img_cross_attn(
+        #         inst_queries,
+        #         context,
+        #         ref_pts = inst_queries_img_ref,
+        #         spatial_shapes = spatial_sshapes,
+        #         level_start_index = level_tart_index,
+        #         cam_params = cam_params,
+        #     ) # bsNcam, N_queries, C
 
-            # inst_queries = self.pos_encoded(inst_queries)
+        # inst_queries = self.pos_encoded(inst_queries)
 
-            pred_radius, cart_coords = self.pred_rad(bs, Ncam, inst_queries, inst_queries_img_sph)
-            pred_sems, idx_clamped = self.pred_semantic(bs, Ncam, inst_queries, cart_coords)
-
-            return_map['pred_radius'] = pred_radius
+        # pred_radius, cart_coords = self.pred_rad(bs, Ncam, inst_queries, inst_queries_img_sph)
+        # pred_sems, idx_clamped = self.pred_semantic(bs, Ncam, inst_queries, cart_coords)
+        # return_map['img_radius'] = context_rad # bsNcam, WH, 100
+        return_map['pred_depth'] = [pred_depth]#, pred_radius] # bsNcam, N_queries, 100
+        return_map['pred_seg'] = [pred_sem]
+        if 'gt_depth' in kwargs.keys():
             return_map['gt_depth'] = kwargs['gt_depth']
-            return_map['sparse_feat'] = pred_sems
-            return_map['sparse_idx'] = idx_clamped
+        if 'gt_seg' in kwargs.keys():
+            return_map['gt_seg'] = kwargs['gt_seg']
+        # return_map['sparse_feat'] = pred_sems
+        # return_map['sparse_idx'] = idx_clamped
 
-            return return_map
+        return return_map
 
-
+    def get_mlp_input(self, rot, tran, intrin, post_rot, post_tran, bda):
+        B, N, _, _ = rot.shape
+        bda = bda.view(B, 1, 3, 3).repeat(1, N, 1, 1)
+        mlp_input = torch.stack([
+            intrin[:, :, 0, 0],
+            intrin[:, :, 1, 1],
+            intrin[:, :, 0, 2],
+            intrin[:, :, 1, 2],
+            post_rot[:, :, 0, 0],
+            post_rot[:, :, 0, 1],
+            post_tran[:, :, 0],
+            post_rot[:, :, 1, 0],
+            post_rot[:, :, 1, 1],
+            post_tran[:, :, 1],
+            bda[:, :, 0, 0],
+            bda[:, :, 0, 1],
+            bda[:, :, 1, 0],
+            bda[:, :, 1, 1],
+            bda[:, :, 2, 2],
+        ],
+                                dim=-1)
+        sensor2ego = torch.cat([rot, tran.reshape(B, N, 3, 1)],
+                               dim=-1).reshape(B, N, -1)    # B, N, 3, 4 -> B, N, 12
+        mlp_input = torch.cat([mlp_input, sensor2ego], dim=-1) # B, N, 27
+        return mlp_input
+    
     def pred_rad(self, batch_size, n_cams, geo_inst_queries, inst_queries_img_sph):
         if self.with_specific_component('query_self_attn_local'):
 
@@ -657,7 +825,7 @@ class QBON_v3(CenterPoint):
                 radius_queries, _ = self.query_self_attn_local(
                     query = radius_queries,
                 ) # bsNcam, N_queries, C
-            radius_queries = self.radius_layer(radius_queries) # bs*Ncam, Nqueries, 100: layer output
+            radius_queries = self.radius_layer_1(radius_queries) # bs*Ncam, Nqueries, 100: layer output
             #############################################################
 
             phi = inst_queries_img_sph[..., 1]
@@ -671,11 +839,15 @@ class QBON_v3(CenterPoint):
 
             mask = radius_range <= r_max_per_query
             # radius_clipped = torch.where(mask, radius, torch.tensor(float('-inf')).to(radius.device))
-            radius_clipped = radius_queries.softmax(dim=-1) # bs*Ncam, N_queries, 100
 
-            radius_range = torch.matmul(radius_clipped, self.radius_range.unsqueeze(-1)) # bs*Ncam, N_queries, 1
+            radius_clipped = radius_queries.detach().softmax(dim=-1) # bs*Ncam, N_queries, 100
 
-            sph_coord = torch.cat([radius_range, inst_queries_img_sph], dim=-1).reshape(bs, Ncam, -1, 3).flatten(1, 2) # bs, Ncam*Nqueries, 3
+            _, indices = torch.max(radius_clipped, dim=-1) # bs*Ncam, Nqueries
+            indices = indices.unsqueeze(-1) * 0.4
+
+            # radius_range = torch.matmul(radius_clipped, self.radius_range.unsqueeze(-1)) # bs*Ncam, N_queries, 1
+
+            sph_coord = torch.cat([indices, inst_queries_img_sph], dim=-1).reshape(bs, Ncam, -1, 3).flatten(1, 2) # bs, Ncam*Nqueries, 3
 
             d = sph_coord[..., 0] * torch.cos(sph_coord[..., 2]) * torch.cos(sph_coord[..., 1]) # bs, Ncam*Nqueries
             w = sph_coord[..., 0] * torch.cos(sph_coord[..., 2]) * torch.sin(sph_coord[..., 1]) 
@@ -685,12 +857,12 @@ class QBON_v3(CenterPoint):
             w = w.unsqueeze(-1)
             h = h.unsqueeze(-1)
 
-            cart_coords = torch.cat([d, w, h], dim=-1) # bs, Ncam*Nqueries, 3
+            cart_coords = torch.cat([w, d, h], dim=-1) # bs, Ncam*Nqueries, 3
 
-            return radius_clipped, cart_coords
+            return radius_queries, cart_coords
 
     def pred_semantic(self, batch_size, n_cams, inst_queries, coords):
-        
+         
         bs = batch_size
         Ncam = n_cams
         _, _, C = inst_queries.shape
@@ -720,7 +892,7 @@ class QBON_v3(CenterPoint):
             coords_clamped[..., 2] = coords_clamped[..., 2].clamp(0, 15)
             
         if self.with_specific_component('fcn_dw_encoder'):
-            dw_flat = self.dw_plane[None, :].repeat(bs, 1, 1, 1) # bs, D, W, C
+            wd_flat = self.dw_plane[None, :].repeat(bs, 1, 1, 1) # bs, D, W, C
             dh_flat = self.dh_plane[None, :].repeat(bs, 1, 1, 1) # bs, D, H, C
             wh_flat = self.wh_plane[None, :].repeat(bs, 1, 1, 1) # bs, W, H, C
 
@@ -731,21 +903,75 @@ class QBON_v3(CenterPoint):
             #         dh_flat[i, pts[i, 0], pts[i, 2]] = dh_flat[i, pts[i, 0], pts[i, 2]] + sem_inst_queries[i, j]
             #         wh_flat[i, pts[i, 1], pts[i, 2]] = wh_flat[i, pts[i, 1], pts[i, 2]] + sem_inst_queries[i, j]
             for i, pts in enumerate(coords_clamped):
-                dw_flat[i, pts[..., 0], pts[..., 1]] += sem_inst_queries[i]
-                wh_flat[i, pts[..., 1], pts[..., 2]] += sem_inst_queries[i]
-                dh_flat[i, pts[..., 0], pts[..., 2]] += sem_inst_queries[i]
+                wd_flat[i, pts[..., 0], pts[..., 1]] += sem_inst_queries[i]
+                dh_flat[i, pts[..., 1], pts[..., 2]] += sem_inst_queries[i]
+                wh_flat[i, pts[..., 0], pts[..., 2]] += sem_inst_queries[i]
 
-            dw_flat = dw_flat.permute(0, 3, 1, 2)  # bs, C, D, W
-            dh_flat = dh_flat.permute(0, 3, 1, 2)
+            wd_flat = wd_flat.permute(0, 3, 1, 2)  # bs, C, D, W
+            dh_flat = dh_flat.permute(0, 3, 1, 2) 
             wh_flat = wh_flat.permute(0, 3, 1, 2)
 
-            dw_flat = self.fcn_dw_encoder(dw_flat)
+            wd_flat = self.fcn_dw_encoder(wd_flat)
             dh_flat = self.fcn_dh_encoder(dh_flat)
             wh_flat = self.fcn_wh_encoder(wh_flat)
 
-            feats = [dw_flat, dh_flat, wh_flat]
+            feats = [wd_flat, dh_flat, wh_flat]
 
         return feats, coords_clamped
+
+    def ol_mixer(self, input, img_grid, rot, tran, intrin, post_rot, post_tran, bda):
+        bs, Ncam, W, H, _ = input.shape # bs, Ncam, W, H, C
+        img_grid = img_grid.flatten(0, 1)[None, None, :, :].repeat(bs, Ncam, 1, 1) # bs, Ncam, WH, 3
+        rot_shift = torch.roll(rot, shifts=-1, dims=1)#.flatten(0, 1) # bs, Ncam, 3, 3
+        intrin_shift = torch.roll(intrin, shifts=-1, dims=1)#.flatten(0, 1) # bs, Ncam, 3, 3
+        
+        # rot = rot.flatten(0, 1) # bs, Ncam, 3, 3
+        # intrin = intrin.flatten(0, 1) # bs,Ncam, 3, 3
+
+        cam_coords = torch.matmul(intrin.inverse().view(bs, Ncam, 1, 3, 3), img_grid.unsqueeze(-1)) # bs, Ncam, WH, 3, 1
+        wld_coords = torch.matmul(rot.view(bs, Ncam, 1, 3, 3), cam_coords) # bs, Ncam, WH, 3, 1
+        
+        shift_cam_coords = torch.matmul(rot_shift.inverse().view(bs, Ncam, 1, 3, 3), wld_coords) # bs, Ncam, WH, 3, 1
+        shift_img_coords = torch.matmul(intrin_shift.view(bs, Ncam, 1, 3, 3), shift_cam_coords).squeeze(-1) # bs, Ncam, WH, 3
+
+        shift_img_coords = shift_img_coords[..., :2] / shift_img_coords[..., 2:] # bs, Ncam, WH, 2
+
+        shift_img_coords = shift_img_coords / (1600 / 704)
+        shift_img_coords[..., -1] -= 140
+        shift_img_coords /= 16 # bs, Ncam, WH, 2
+        shift_img_coords = shift_img_coords.reshape(bs, Ncam, W, H, -1).long() # bs, Ncam, W, H, 2
+        # img_coords = torch.roll(shift_img_coords, shifts=1, dims=1) # bs, Ncam, W, H, 2
+
+        x_mask = (shift_img_coords[..., 0] >= 0) & (shift_img_coords[..., 0] < 44)
+        y_mask = (shift_img_coords[..., 1] >= 0) & (shift_img_coords[..., 1] < 16)
+        
+        overlapped_mask = x_mask & y_mask # bs, Ncam, WH
+        overlapped_mask = overlapped_mask.reshape(bs, Ncam, W, H)
+
+        # overlapped_mask_ = overlapped_mask.to('cpu').numpy()
+        # np.save("overlapped_mask.npy", overlapped_mask_)
+        # shift_img_coords_ = shift_img_coords.to('cpu').numpy()
+        # np.save("shifted_img_coords.npy", shift_img_coords_)
+        # assert False
+        mask = torch.where(overlapped_mask)
+        # b_idx, c_idx, W_idx, H_idx = torch.where(overlapped_mask)
+
+        N = mask[0].shape[0]
+        n = N // 2 # Exchange 50% of overlapped area features
+
+        torch.manual_seed(42)
+        indices = torch.randperm(N)[:n]
+
+        mask = tuple(m[indices] for m in mask)
+
+        b_idx, c_idx, W_idx, H_idx = mask
+
+        c_idx_next = ((c_idx + 1) % Ncam).long()
+
+        input[b_idx, c_idx, W_idx, H_idx] = input[b_idx, c_idx_next, shift_img_coords[b_idx, c_idx, W_idx, H_idx, 0], shift_img_coords[b_idx, c_idx, W_idx, H_idx, 1]]
+
+        return input
+
 
     def extract_lidar_bev_feat(self, pts, img_feats, img_metas):
         """Extract features of points."""
@@ -789,11 +1015,11 @@ class QBON_v3(CenterPoint):
             else:
                 raise TypeError(
                     f'{loss_name} is not a tensor or list of tensors')
-
+            
         loss = sum(_value for _key, _value in log_vars.items()
                    if 'loss' in _key)
-        loss_rad = sum(_value for _key, _value in log_vars.items()
-                   if 'radius' in _key)
+        # loss_rad = sum(_value for _key, _value in log_vars.items()
+        #            if 'radius' in _key)
 
         # If the loss_vars has different length, GPUs will wait infinitely
         if dist.is_available() and dist.is_initialized():
@@ -805,7 +1031,7 @@ class QBON_v3(CenterPoint):
             assert log_var_length == len(log_vars) * dist.get_world_size(), \
                 'loss log variables are different across GPUs!\n' + message
 
-        log_vars['loss'] = loss + loss_rad
+        log_vars['loss'] = loss # + loss_rad
         for loss_name, loss_value in log_vars.items():
             # reduce loss when distributed training
             if dist.is_available() and dist.is_initialized():
@@ -813,7 +1039,7 @@ class QBON_v3(CenterPoint):
                 dist.all_reduce(loss_value.div_(dist.get_world_size()))
             log_vars[loss_name] = loss_value.item()
 
-        return loss, loss_rad, log_vars
+        return loss, log_vars#loss_rad, log_vars
 
     def train_step(self, data, optimizer):
         """The iteration step during training.
@@ -843,10 +1069,10 @@ class QBON_v3(CenterPoint):
                   averaging the logs.
         """
         losses = self(**data)
-        loss, loss_rad, log_vars = self._parse_losses(losses)
+        loss, log_vars = self._parse_losses(losses)
 
         outputs = dict(
-            loss=loss, loss_rad=loss_rad, log_vars=log_vars, num_samples=len(data['img_metas']))
+            loss=loss, log_vars=log_vars, num_samples=len(data['img_metas']))
 
         return outputs
     
@@ -912,6 +1138,11 @@ class QBON_v3(CenterPoint):
             loss_depth = self.depth_net.get_depth_loss(kwargs['gt_depth'], results['depth'])
             losses.update(loss_depth)
         # print(f"loss Calc Time: {time.time()-t}")
+
+        #aux_loss={}
+        losses['depth_ce_loss'], losses['seg_focal_loss']= auxiliary_loss(results['gt_depth'], results['gt_seg'], results['pred_depth'], results['pred_seg'], results['cam_params'])#, results['img_glob_sph']) results['pred_pixel_coords']
+        #aux_loss['depth_ce_loss'], aux_loss['seg_loss'] 
+        #losses.update(aux_loss)
         return losses
 
     def forward_test(self,
